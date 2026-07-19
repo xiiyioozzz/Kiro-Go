@@ -81,8 +81,8 @@ func TestValidateExternalIdpEndpoint(t *testing.T) {
 		}
 	}
 	invalid := []string{
-		"http://login.microsoftonline.com/x",      // not https
-		"https://evil-microsoftonline.com/x",       // suffix not anchored to a subdomain boundary
+		"http://login.microsoftonline.com/x",        // not https
+		"https://evil-microsoftonline.com/x",        // suffix not anchored to a subdomain boundary
 		"https://login.microsoftonline.com.evil.co", // not an allowed suffix
 		"https://10.0.0.5/x",                        // IP literal
 		"https://accounts.google.com/x",             // not allow-listed
@@ -137,6 +137,97 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	u, _ := url.Parse(raw)
 	if _, ok := u.Query()["login_hint"]; ok {
 		t.Fatalf("login_hint should be omitted when empty")
+	}
+}
+
+func TestNormalizeKiroLoginMetadataDomain(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantHint string
+	}{
+		{"user@ChinaQ3.Site", "chinaq3.site", "user@ChinaQ3.Site"},
+		{"https://chinaq3.site/", "chinaq3.site", ""},
+		{"kiro.dev/team_1", "kiro.dev/team_1", ""},
+	}
+	for _, tc := range cases {
+		gotName, gotHint, err := normalizeKiroLoginMetadataDomain(tc.in)
+		if err != nil {
+			t.Fatalf("normalizeKiroLoginMetadataDomain(%q): %v", tc.in, err)
+		}
+		if gotName != tc.wantName || gotHint != tc.wantHint {
+			t.Fatalf("normalizeKiroLoginMetadataDomain(%q) = (%q, %q), want (%q, %q)", tc.in, gotName, gotHint, tc.wantName, tc.wantHint)
+		}
+	}
+	if _, _, err := normalizeKiroLoginMetadataDomain("bad@@example.com"); err == nil {
+		t.Fatalf("expected invalid email to be rejected")
+	}
+}
+
+func TestFetchKiroLoginMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Amz-Target"); got != kiroLoginMetadataTarget {
+			t.Fatalf("X-Amz-Target = %q", got)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["domainName"] != "chinaq3.site" {
+			t.Fatalf("domainName = %q", body["domainName"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"found":true,"issuerUrl":"https://login.microsoftonline.com/t/v2.0","clientId":"client-1","scopes":["offline_access"]}`))
+	}))
+	defer srv.Close()
+
+	origURL := kiroLoginMetadataURL
+	kiroLoginMetadataURL = func() string { return srv.URL + "/" }
+	defer func() { kiroLoginMetadataURL = origURL }()
+
+	meta, err := fetchKiroLoginMetadata(srv.Client(), "chinaq3.site")
+	if err != nil {
+		t.Fatalf("fetchKiroLoginMetadata: %v", err)
+	}
+	if !meta.Found || meta.ClientID != "client-1" || meta.IssuerURL == "" || len(meta.Scopes) != 1 {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+}
+
+func TestBuildKiroExternalIdpDescriptorURL(t *testing.T) {
+	raw := buildKiroExternalIdpDescriptorURL("state-1", "user@example.com", kiroLoginMetadata{
+		Audience:  "aud",
+		ClientID:  "client-1",
+		Found:     true,
+		IssuerURL: "https://login.microsoftonline.com/t/v2.0",
+		Scopes:    []string{"api://client-1/codewhisperer:conversations", "offline_access"},
+	})
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if u.Scheme != "http" || u.Host != "127.0.0.1:3128" || u.Path != "/signin/callback" {
+		t.Fatalf("descriptor URL target = %s://%s%s", u.Scheme, u.Host, u.Path)
+	}
+	q := u.Query()
+	checks := map[string]string{
+		"login_option": "external_idp",
+		"login_hint":   "user@example.com",
+		"issuer_url":   "https://login.microsoftonline.com/t/v2.0",
+		"client_id":    "client-1",
+		"state":        "state-1",
+		"audience":     "aud",
+	}
+	for k, want := range checks {
+		if got := q.Get(k); got != want {
+			t.Fatalf("descriptor param %q = %q, want %q", k, got, want)
+		}
+	}
+	if !strings.Contains(q.Get("scopes"), "offline_access") {
+		t.Fatalf("expected offline_access in scopes, got %q", q.Get("scopes"))
 	}
 }
 
@@ -238,8 +329,8 @@ func TestValidateExternalIdpEndpointAcceptsAllowListed(t *testing.T) {
 // and non-allow-listed hosts.
 func TestValidateExternalIdpEndpointRejectsUnsafe(t *testing.T) {
 	for _, raw := range []string{
-		"http://login.microsoftonline.com/x",  // not https
-		"https://127.0.0.1/oauth/token",       // IP literal
+		"http://login.microsoftonline.com/x",   // not https
+		"https://127.0.0.1/oauth/token",        // IP literal
 		"https://evil.example.com/oauth/token", // not allow-listed
 	} {
 		if err := ValidateExternalIdpEndpoint(raw); err == nil {

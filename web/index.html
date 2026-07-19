@@ -134,7 +134,8 @@
     <div class="container">
       <!-- Stats summary -->
       <div class="stats-grid">
-        <div class="stat-card">
+        <div class="stat-card stat-card--account-summary" id="statAccountsCard" tabindex="0"
+          aria-describedby="statAccountsTooltip">
           <div class="stat-card-title" data-i18n="stats.accounts"></div>
           <div class="stat-body">
             <div class="stat-main">
@@ -146,6 +147,7 @@
             </div>
             <i class="fa-solid fa-users stat-icon" aria-hidden="true"></i>
           </div>
+          <div class="stat-popover" id="statAccountsTooltip" role="tooltip"></div>
         </div>
         <div class="stat-card">
           <div class="stat-card-title" data-i18n="stats.requests"></div>
@@ -215,6 +217,7 @@
               <button class="btn btn-primary btn-xs" data-batch="enable" data-i18n="batch.enable"></button>
               <button class="btn btn-secondary btn-xs" data-batch="disable" data-i18n="batch.disable"></button>
               <button class="btn btn-secondary btn-xs" data-batch="refresh" data-i18n="batch.refresh"></button>
+              <button class="btn btn-secondary btn-xs" data-batch="test" data-i18n="batch.test"></button>
               <button class="btn btn-secondary btn-xs" data-batch="refreshModels"
                 data-i18n="batch.refreshModels"></button>
               <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>

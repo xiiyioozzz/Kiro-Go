@@ -22,6 +22,59 @@ func TestNormalizeChunkBasicProgression(t *testing.T) {
 	}
 }
 
+func TestBuildKiroRequestBodyTransformsCLIShape(t *testing.T) {
+	var payload KiroPayload
+	payload.ProfileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
+	payload.ConversationState.AgentContinuationId = "agent-continuation"
+	payload.ConversationState.ChatTriggerType = "MANUAL"
+	payload.ConversationState.ConversationID = "conv"
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hi",
+		ModelID: "claude-sonnet-4",
+		Origin:  "AI_EDITOR",
+	}
+	payload.ConversationState.History = []KiroHistoryMessage{{
+		UserInputMessage: &KiroUserInputMessage{
+			Content: "old",
+			ModelID: "claude-sonnet-4",
+			Origin:  "AI_EDITOR",
+		},
+	}}
+
+	body, err := buildKiroRequestBody(&payload, kiroCLIEndpoint)
+	if err != nil {
+		t.Fatalf("build request body: %v", err)
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, ok := got["profileArn"]; ok {
+		t.Fatalf("expected CLI body to omit profileArn, got %s", string(body))
+	}
+	state := got["conversationState"].(map[string]interface{})
+	if _, ok := state["agentContinuationId"]; ok {
+		t.Fatalf("expected CLI body to omit agentContinuationId, got %s", string(body))
+	}
+	current := state["currentMessage"].(map[string]interface{})["userInputMessage"].(map[string]interface{})
+	if current["origin"] != "KIRO_CLI" {
+		t.Fatalf("expected current origin KIRO_CLI, got %#v", current["origin"])
+	}
+	history := state["history"].([]interface{})
+	userHistory := history[0].(map[string]interface{})["userInputMessage"].(map[string]interface{})
+	if userHistory["origin"] != "KIRO_CLI" {
+		t.Fatalf("expected history origin KIRO_CLI, got %#v", userHistory["origin"])
+	}
+	if _, ok := userHistory["modelId"]; ok {
+		t.Fatalf("expected CLI history message to omit modelId, got %#v", userHistory)
+	}
+	if payload.ProfileArn == "" || payload.ConversationState.AgentContinuationId == "" ||
+		payload.ConversationState.History[0].UserInputMessage.ModelID == "" {
+		t.Fatalf("buildKiroRequestBody mutated original payload")
+	}
+}
+
 func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
 	prev := ""
 

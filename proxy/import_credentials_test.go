@@ -139,17 +139,56 @@ func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 // authOidcURL captures the current oidc URL builder so the test can restore it.
 func authOidcURL() func(string) string { return auth.GetOIDCTokenURLForTest() }
 
+func TestApiImportCredentialsAcceptsKiroAPIKeyWithoutRefreshToken(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := `{"authMethod":"api_key","provider":"APIKey","kiroApiKey":"ksk_test_import_key","region":"eu-central-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 importing API key credential, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected one account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "api_key" {
+		t.Fatalf("expected authMethod api_key, got %q", got.AuthMethod)
+	}
+	if got.KiroAPIKey != "ksk_test_import_key" || got.AccessToken != "ksk_test_import_key" {
+		t.Fatalf("expected API key to be stored as kiroApiKey/accessToken, got %+v", got)
+	}
+	if got.RefreshToken != "" {
+		t.Fatalf("expected no refreshToken for API key credential, got %q", got.RefreshToken)
+	}
+	if got.ExpiresAt != 0 {
+		t.Fatalf("expected non-expiring API key account, got expiresAt=%d", got.ExpiresAt)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("expected imported region to be preserved, got %q", got.Region)
+	}
+}
+
 // TestNormalizeImportAuthMethod pins the auth-method normalization for import,
 // including the key regression: external_idp accounts carry clientId but NO
 // clientSecret, so the old default branch misclassified them as "social".
 func TestNormalizeImportAuthMethod(t *testing.T) {
 	cases := []struct {
-		name           string
-		authMethod     string
-		clientID       string
-		clientSecret   string
-		tokenEndpoint  string
-		want           string
+		name          string
+		authMethod    string
+		clientID      string
+		clientSecret  string
+		tokenEndpoint string
+		want          string
 	}{
 		{"explicit external_idp", "external_idp", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},
 		{"azure alias", "AzureAD", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},

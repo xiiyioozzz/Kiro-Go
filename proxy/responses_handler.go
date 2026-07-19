@@ -130,6 +130,8 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -137,6 +139,7 @@ func (h *Handler) handleResponsesNonStream(
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -149,6 +152,7 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamEndpoint string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -164,11 +168,15 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastUpstreamEndpoint = upstreamEndpoint
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -189,7 +197,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -210,7 +218,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.recordFailureWithDetails("responses", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -314,6 +322,8 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	responseStarted := false
 	reqStart := time.Now()
 
@@ -322,6 +332,7 @@ func (h *Handler) handleResponsesStream(
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -335,13 +346,14 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText         strings.Builder
+			reasoningText    strings.Builder
+			toolUses         []KiroToolUse
+			inputTokens      int
+			outputTokens     int
+			credits          float64
+			realInputTokens  int
+			upstreamEndpoint string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -468,12 +480,16 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
+				lastUpstreamEndpoint = upstreamEndpoint
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, err)
 				continue
@@ -489,7 +505,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-			h.recordFailureWithDetails("responses", model, account.ID, err)
+			h.recordFailureWithDetails("responses", upstreamEndpoint, model, account.ID, err)
 			return
 		}
 
@@ -536,7 +552,7 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
@@ -572,7 +588,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.recordFailureWithDetails("responses", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

@@ -12,10 +12,12 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,19 +37,22 @@ func GenerateMachineId() string {
 // Account represents a Kiro API account with authentication credentials and usage statistics.
 type Account struct {
 	// Basic identification
-	ID       string `json:"id"`                 // Unique account identifier (UUID)
-	Email    string `json:"email,omitempty"`    // User email address
-	UserId   string `json:"userId,omitempty"`   // Kiro user ID
-	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
+	ID        string `json:"id"`                  // Unique account identifier (UUID)
+	Email     string `json:"email,omitempty"`     // User email address
+	UserId    string `json:"userId,omitempty"`    // Kiro user ID
+	Nickname  string `json:"nickname,omitempty"`  // Display name for admin panel
+	CreatedAt int64  `json:"createdAt,omitempty"` // Account creation timestamp (Unix seconds)
 
 	// Authentication credentials
 	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
+	KiroAPIKey   string `json:"kiroApiKey,omitempty"`   // Kiro API key credential (ksk_*, used directly as Bearer token)
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc", "social", "external_idp", or "api_key"
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
+	Region       string `json:"region"`                 // Kiro/Profile data-plane region for API calls
+	AuthRegion   string `json:"authRegion,omitempty"`   // AWS SSO OIDC region for idc token refresh
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
@@ -96,11 +101,14 @@ type Account struct {
 	DaysRemaining     int    `json:"daysRemaining,omitempty"`     // Days until subscription expires
 
 	// Usage tracking
-	UsageCurrent  float64 `json:"usageCurrent,omitempty"`  // Current period usage (credits)
-	UsageLimit    float64 `json:"usageLimit,omitempty"`    // Maximum allowed usage per period
-	UsagePercent  float64 `json:"usagePercent,omitempty"`  // Usage percentage (0.0-1.0)
-	NextResetDate string  `json:"nextResetDate,omitempty"` // Date when usage resets (YYYY-MM-DD)
-	LastRefresh   int64   `json:"lastRefresh,omitempty"`   // Last info refresh timestamp
+	UsageCurrent    float64 `json:"usageCurrent,omitempty"`    // Current period usage (credits)
+	UsageLimit      float64 `json:"usageLimit,omitempty"`      // Maximum allowed usage per period
+	UsagePercent    float64 `json:"usagePercent,omitempty"`    // Usage percentage (0.0-1.0)
+	NextResetDate   string  `json:"nextResetDate,omitempty"`   // Date when usage resets (YYYY-MM-DD)
+	LastRefresh     int64   `json:"lastRefresh,omitempty"`     // Last info refresh timestamp
+	UsageSyncStatus string  `json:"usageSyncStatus,omitempty"` // Last upstream usage sync result: success/failed/auth_failed/suspended/quota_exhausted
+	UsageSyncError  string  `json:"usageSyncError,omitempty"`  // Last upstream usage sync error summary
+	UsageSyncAt     int64   `json:"usageSyncAt,omitempty"`     // Last upstream usage sync attempt timestamp
 
 	// Trial usage tracking
 	TrialUsageCurrent float64 `json:"trialUsageCurrent,omitempty"` // Trial quota current usage
@@ -232,6 +240,9 @@ type AccountInfo struct {
 	UsagePercent      float64
 	NextResetDate     string
 	LastRefresh       int64
+	UsageSyncStatus   string
+	UsageSyncError    string
+	UsageSyncAt       int64
 	TrialUsageCurrent float64
 	TrialUsageLimit   float64
 	TrialUsagePercent float64
@@ -414,8 +425,8 @@ func GetAccounts() []Account {
 }
 
 // AccountIDExists reports whether an account with the given ID is already stored.
-// Used by the credential-import path to reuse a pasted record's id when it does
-// not collide, so re-importing a backup never creates a duplicate entry.
+// This only checks the storage identifier; semantic duplicate detection lives in
+// AddAccount so every account creation path shares the same guard.
 func AccountIDExists(id string) bool {
 	if id == "" {
 		return false
@@ -442,22 +453,198 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+type DuplicateAccountError struct {
+	ExistingID    string
+	ExistingLabel string
+}
+
+func (e *DuplicateAccountError) Error() string {
+	if e.ExistingLabel != "" {
+		return fmt.Sprintf("duplicate account already exists: %s", e.ExistingLabel)
+	}
+	if e.ExistingID != "" {
+		return fmt.Sprintf("duplicate account already exists: %s", e.ExistingID)
+	}
+	return "duplicate account already exists"
+}
+
+func IsDuplicateAccountError(err error) bool {
+	_, ok := err.(*DuplicateAccountError)
+	return ok
+}
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if account.CreatedAt > 0 {
+		account.CreatedAt = normalizeUnixSeconds(account.CreatedAt)
+	} else {
+		account.CreatedAt = time.Now().Unix()
+	}
+
+	newKeys := accountIdentityKeys(account)
 	// Reject a duplicate id under the write lock. The import path pre-checks with
 	// AccountIDExists (RLock) and mints a fresh id on collision, but that check and this
 	// append are not atomic; two concurrent imports of the same pasted id could both
 	// pass the pre-check. This makes "add if id absent" the atomic invariant.
-	if account.ID != "" {
-		for _, a := range cfg.Accounts {
+	for _, a := range cfg.Accounts {
+		if account.ID != "" {
 			if a.ID == account.ID {
-				return fmt.Errorf("account with id %s already exists", account.ID)
+				return &DuplicateAccountError{ExistingID: a.ID, ExistingLabel: accountSafeLabel(a)}
 			}
+		}
+		if accountHasAnyIdentityKey(a, newKeys) {
+			return &DuplicateAccountError{ExistingID: a.ID, ExistingLabel: accountSafeLabel(a)}
 		}
 	}
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
+}
+
+func accountHasAnyIdentityKey(account Account, keys map[string]struct{}) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	for key := range accountIdentityKeys(account) {
+		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func accountIdentityKeys(account Account) map[string]struct{} {
+	keys := make(map[string]struct{})
+	add := func(prefix string, parts ...string) {
+		normalized := make([]string, 0, len(parts))
+		for _, part := range parts {
+			p := normalizeIdentityPart(part)
+			if p == "" {
+				return
+			}
+			normalized = append(normalized, p)
+		}
+		keys[prefix+":"+strings.Join(normalized, "|")] = struct{}{}
+	}
+
+	region := normalizeIdentityPart(account.Region)
+	if region == "" {
+		region = normalizeIdentityPart(regionFromProfileArn(account.ProfileArn))
+	}
+	authKey := accountAuthIdentity(account)
+
+	if apiKeyHash := kiroAPIKeyHash(account.KiroAPIKey); apiKeyHash != "" {
+		add("kiro-api-key", apiKeyHash)
+		return keys
+	}
+	add("profile", account.ProfileArn)
+	add("user-region", account.UserId, region)
+	add("email-region", account.Email, authKey, region)
+	if shouldUseProviderlessEmailKey(account) {
+		add("email-region-auth", account.Email, accountAuthMethodIdentity(account), region)
+	}
+	add("external-idp", account.Email, account.ClientID, account.IssuerURL, region)
+	add("idc", account.Email, account.ClientID, account.StartUrl, region)
+
+	if len(keys) == 0 {
+		add("refresh-region", account.RefreshToken, region)
+	}
+	return keys
+}
+
+func normalizeIdentityPart(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func IsAPIKeyAuthMethod(authMethod string) bool {
+	authMethod = normalizeIdentityPart(authMethod)
+	return authMethod == "api_key" || authMethod == "apikey"
+}
+
+func IsAPIKeyAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	return strings.TrimSpace(account.KiroAPIKey) != "" || IsAPIKeyAuthMethod(account.AuthMethod)
+}
+
+func kiroAPIKeyHash(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func accountAuthIdentity(account Account) string {
+	authMethod := accountAuthMethodIdentity(account)
+	if provider := normalizeIdentityPart(account.Provider); provider != "" {
+		return authMethod + "/" + provider
+	}
+	return authMethod
+}
+
+func accountAuthMethodIdentity(account Account) string {
+	authMethod := normalizeIdentityPart(account.AuthMethod)
+	if authMethod == "" {
+		return "unknown"
+	}
+	return authMethod
+}
+
+func shouldUseProviderlessEmailKey(account Account) bool {
+	authMethod := normalizeIdentityPart(account.AuthMethod)
+	return authMethod == "" || authMethod == "idc" || authMethod == "external_idp"
+}
+
+func accountSafeLabel(account Account) string {
+	if strings.TrimSpace(account.KiroAPIKey) != "" || IsAPIKeyAuthMethod(account.AuthMethod) {
+		return "Kiro API Key " + maskKiroAPIKey(account.KiroAPIKey)
+	}
+	if strings.TrimSpace(account.Email) != "" {
+		return account.Email
+	}
+	if strings.TrimSpace(account.UserId) != "" {
+		return "userId " + account.UserId
+	}
+	if strings.TrimSpace(account.ProfileArn) != "" {
+		return "profile " + account.ProfileArn
+	}
+	return account.ID
+}
+
+func maskKiroAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "(empty)"
+	}
+	if len(key) <= 10 {
+		return key[:minInt(len(key), 4)] + "***"
+	}
+	return key[:6] + "..." + key[len(key)-4:]
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func regionFromProfileArn(profileArn string) string {
+	parts := strings.Split(strings.TrimSpace(profileArn), ":")
+	if len(parts) >= 4 {
+		return parts[3]
+	}
+	return ""
+}
+
+func normalizeUnixSeconds(ts int64) int64 {
+	if ts > 1_000_000_000_000 {
+		return ts / 1000
+	}
+	return ts
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -541,6 +728,23 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].ProfileArn = profileArn
+			return Save()
+		}
+	}
+	return nil
+}
+
+func UpdateAccountProfileArnAndRegion(id, profileArn, region string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if region != "" {
+				cfg.Accounts[i].Region = region
+			}
 			return Save()
 		}
 	}
@@ -667,11 +871,34 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].UsagePercent = info.UsagePercent
 			cfg.Accounts[i].NextResetDate = info.NextResetDate
 			cfg.Accounts[i].LastRefresh = info.LastRefresh
+			if info.UsageSyncStatus != "" {
+				cfg.Accounts[i].UsageSyncStatus = info.UsageSyncStatus
+			}
+			cfg.Accounts[i].UsageSyncError = info.UsageSyncError
+			if info.UsageSyncAt != 0 {
+				cfg.Accounts[i].UsageSyncAt = info.UsageSyncAt
+			}
 			cfg.Accounts[i].TrialUsageCurrent = info.TrialUsageCurrent
 			cfg.Accounts[i].TrialUsageLimit = info.TrialUsageLimit
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
+			return Save()
+		}
+	}
+	return nil
+}
+
+// UpdateAccountUsageSync records the result of the latest upstream usage sync
+// attempt without overwriting the last successfully fetched quota numbers.
+func UpdateAccountUsageSync(id, status, errSummary string, checkedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			cfg.Accounts[i].UsageSyncStatus = status
+			cfg.Accounts[i].UsageSyncError = errSummary
+			cfg.Accounts[i].UsageSyncAt = checkedAt
 			return Save()
 		}
 	}

@@ -42,7 +42,20 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	if account.AuthMethod == "social" {
 		return refreshSocialToken(account.RefreshToken, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+	region := strings.TrimSpace(account.Region)
+	if strings.EqualFold(account.AuthMethod, "idc") {
+		if authRegion := strings.TrimSpace(account.AuthRegion); authRegion != "" {
+			region = authRegion
+		} else if strings.TrimSpace(account.StartUrl) != "" {
+			if detectedRegion, err := discoverIamSsoRegion(account.StartUrl); err == nil && detectedRegion != "" {
+				region = detectedRegion
+			}
+		}
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, region, client)
 }
 
 // refreshExternalIdpToken refreshes an external-IdP (enterprise SSO) access token

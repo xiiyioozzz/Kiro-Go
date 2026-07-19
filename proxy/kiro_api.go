@@ -31,8 +31,9 @@ func regionFromProfileArn(profileArn string) string {
 }
 
 // kiroRegion returns the AWS data-plane region for Kiro / Q calls.
-// Prefer profileArn because account.Region is the auth/OIDC region and can
-// differ from the profile's region.
+// Prefer profileArn because it is the upstream source of truth. account.Region is
+// the operator-selected profile/data-plane region; account.AuthRegion is reserved
+// for AWS SSO OIDC token refresh and is intentionally not used here.
 func kiroRegion(account *config.Account) string {
 	return kiroRegionForProfile(account, "")
 }
@@ -58,10 +59,23 @@ func regionalizeURL(rawURL string, account *config.Account) string {
 	return regionalizeURLForProfile(rawURL, account, "")
 }
 
+func kiroRestBaseForAccount(account *config.Account) string {
+	if config.IsAPIKeyAccount(account) {
+		return kiroQAPIBase
+	}
+	return kiroRestAPIBase
+}
+
+func kiroRestOriginForAccount(account *config.Account) string {
+	if config.IsAPIKeyAccount(account) {
+		return "KIRO_CLI"
+	}
+	return "AI_EDITOR"
+}
+
 // regionalizeURLForProfile points a hardcoded us-east-1 Kiro endpoint at the
 // data-plane region derived from the profile (payload ARN first, then the account's
-// cached ARN, then account.Region). account.Region is the auth/OIDC region and can
-// differ from the profile's region, so the profile ARN is preferred.
+// cached ARN, then account.Region).
 func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn string) string {
 	return regionalizeURLForRegion(rawURL, kiroRegionForProfile(account, profileArn))
 }
@@ -87,8 +101,8 @@ func regionalizeURLForRegion(rawURL, region string) string {
 }
 
 // defaultKiroProfileRegions is the ordered set of regions probed when an account's
-// home region is unknown. us-east-1 is the historical default every login falls
-// back to; eu-central-1 is where EU-provisioned Azure-tenant profiles
+// home region is unknown. us-east-1 is the historical default every profile probe
+// falls back to; eu-central-1 is where EU-provisioned Azure-tenant profiles
 // (e.g. KiroProfile-eu-central-1) live. Override or extend with the
 // KIRO_PROFILE_REGIONS env var (comma-separated) to onboard further regions
 // without a code change.
@@ -99,11 +113,19 @@ var defaultKiroProfileRegions = []string{"us-east-1", "eu-central-1"}
 // is always tried first. Cross-region fallbacks are only added when the home region
 // is genuinely unknown — an external_idp (Azure-tenant) login, which defaults to
 // us-east-1, or an account with no region at all. An idc/social/Builder ID account
-// already carries its real region (from the SSO portal / the us-east-1 default), so
+// already carries its selected data-plane region, so
 // it is probed against that single region exactly as before — no extra upstream calls
 // and no chance of its established region being flipped. KIRO_PROFILE_REGIONS, when
 // set, replaces the built-in fallback set (the account region is still tried first).
 func kiroProfileRegionCandidates(account *config.Account) []string {
+	return kiroProfileRegionCandidatesFor(account, shouldProbeFallbackRegions(account))
+}
+
+func kiroProfileDetectionRegionCandidates(account *config.Account) []string {
+	return kiroProfileRegionCandidatesFor(account, true)
+}
+
+func kiroProfileRegionCandidatesFor(account *config.Account, includeFallbacks bool) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(region string) {
@@ -118,7 +140,7 @@ func kiroProfileRegionCandidates(account *config.Account) []string {
 	if account != nil {
 		add(account.Region)
 	}
-	if !shouldProbeFallbackRegions(account) {
+	if !includeFallbacks {
 		return out
 	}
 	if env := strings.TrimSpace(os.Getenv("KIRO_PROFILE_REGIONS")); env != "" {
@@ -153,7 +175,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/getUsageLimits?origin=%s&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestBaseForAccount(account), neturl.QueryEscape(kiroRestOriginForAccount(account)))
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
@@ -184,9 +206,9 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 // GetUserInfo 获取用户信息
 func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
-	url := regionalizeURL(fmt.Sprintf("%s/GetUserInfo", kiroRestAPIBase), account)
+	url := regionalizeURL(fmt.Sprintf("%s/GetUserInfo", kiroRestBaseForAccount(account)), account)
 
-	payload := `{"origin":"KIRO_IDE"}`
+	payload := fmt.Sprintf(`{"origin":%q}`, kiroRestOriginForAccount(account))
 	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -219,7 +241,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/ListAvailableModels?origin=%s&maxResults=50", kiroRestBaseForAccount(account), neturl.QueryEscape(kiroRestOriginForAccount(account)))
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
@@ -257,6 +279,9 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
 	}
+	if config.IsAPIKeyAccount(account) {
+		return "", fmt.Errorf("profile ARN resolution skipped for Kiro API Key account")
+	}
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
 	}
@@ -275,10 +300,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		// region, which can legitimately differ from the profile's region).
 		profileArn, err := resolveProfileArnAcrossRegions(account)
 		if err == nil && profileArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = profileArn
+			cacheResolvedProfileArn(account, profileArn)
 			return profileArn, nil
 		}
 		profileUnsupportedErr = err
@@ -289,10 +311,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	if account.RefreshToken != "" {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
 		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = refreshedArn
+			cacheResolvedProfileArn(account, refreshedArn)
 			return refreshedArn, nil
 		}
 	}
@@ -306,6 +325,33 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	}
 
 	return "", fmt.Errorf("no available Kiro profile")
+}
+
+func cacheResolvedProfileArn(account *config.Account, profileArn string) {
+	if account == nil || strings.TrimSpace(profileArn) == "" {
+		return
+	}
+	profileRegion := ""
+	if shouldPersistProfileRegion(account) {
+		profileRegion = regionFromProfileArn(profileArn)
+	}
+	if updateErr := config.UpdateAccountProfileArnAndRegion(account.ID, profileArn, profileRegion); updateErr != nil {
+		logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+	}
+	account.ProfileArn = profileArn
+	if profileRegion != "" {
+		account.Region = profileRegion
+	}
+}
+
+func shouldPersistProfileRegion(account *config.Account) bool {
+	if account == nil {
+		return false
+	}
+	if strings.TrimSpace(account.Region) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
 }
 
 func isBuilderIDProfileUnsupportedError(account *config.Account, err error) bool {
@@ -371,6 +417,9 @@ func isProfileArnResolutionSoftError(err error) bool {
 }
 
 func ensureRestProfileArn(account *config.Account) error {
+	if config.IsAPIKeyAccount(account) {
+		return nil
+	}
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
@@ -396,8 +445,16 @@ func ensureRestProfileArn(account *config.Account) error {
 // Builder ID "unsupported" 403 is authoritative across all regions, so it
 // short-circuits the probe rather than repeating per region.
 func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
+	return resolveProfileArnAcrossCandidateRegions(account, kiroProfileRegionCandidates(account))
+}
+
+func detectProfileArnAcrossRegions(account *config.Account) (string, error) {
+	return resolveProfileArnAcrossCandidateRegions(account, kiroProfileDetectionRegionCandidates(account))
+}
+
+func resolveProfileArnAcrossCandidateRegions(account *config.Account, regions []string) (string, error) {
 	var lastErr error
-	for _, region := range kiroProfileRegionCandidates(account) {
+	for _, region := range regions {
 		arn, probeErr := listAvailableProfilesWithRetryInRegion(account, region)
 		if probeErr == nil && strings.TrimSpace(arn) != "" {
 			return arn, nil
@@ -521,13 +578,20 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
+	checkedAt := time.Now().Unix()
 	info := &config.AccountInfo{
-		LastRefresh: time.Now().Unix(),
+		LastRefresh:     checkedAt,
+		UsageSyncStatus: "success",
+		UsageSyncAt:     checkedAt,
 	}
 
 	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
 	if err != nil {
+		status := usageSyncStatusFromError(err)
+		errSummary := summarizeUsageSyncError(err)
+		_ = config.UpdateAccountUsageSync(account.ID, status, errSummary, checkedAt)
+
 		// 检测封禁状态
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
@@ -540,6 +604,9 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			updatedAccount.BanStatus = "BANNED"
 			updatedAccount.BanReason = "AWS temporarily suspended - unusual user activity detected"
 			updatedAccount.BanTime = time.Now().Unix()
+			updatedAccount.UsageSyncStatus = status
+			updatedAccount.UsageSyncError = errSummary
+			updatedAccount.UsageSyncAt = checkedAt
 
 			// 保存更新后的账户状态
 			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
@@ -558,6 +625,9 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			updatedAccount.BanStatus = "BANNED"
 			updatedAccount.BanReason = "Authentication failed - token invalid or expired"
 			updatedAccount.BanTime = time.Now().Unix()
+			updatedAccount.UsageSyncStatus = status
+			updatedAccount.UsageSyncError = errSummary
+			updatedAccount.UsageSyncAt = checkedAt
 
 			// 保存更新后的账户状态
 			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
@@ -653,6 +723,39 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	}
 
 	return info, nil
+}
+
+func usageSyncStatusFromError(err error) string {
+	if err == nil {
+		return "success"
+	}
+	msg := err.Error()
+	switch {
+	case isSuspensionErrorMessage(msg):
+		return "suspended"
+	case isQuotaErrorMessage(msg):
+		return "quota_exhausted"
+	case isAuthErrorMessage(msg):
+		return "auth_failed"
+	case isProfileUnavailableErrorMessage(msg):
+		return "profile_unavailable"
+	default:
+		return "failed"
+	}
+}
+
+func summarizeUsageSyncError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.Join(strings.Fields(msg), " ")
+	const maxLen = 500
+	if len(msg) > maxLen {
+		msg = msg[:maxLen] + "..."
+	}
+	return msg
 }
 
 func parseSubscriptionType(raw string) string {

@@ -93,7 +93,7 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 
 	// 3) Already a valid Kiro model (dot form or bare family like claude-sonnet-4): pass through.
 	if strings.HasPrefix(lower, "claude-") {
-		return model, thinking
+		return lower, thinking
 	}
 
 	return model, thinking

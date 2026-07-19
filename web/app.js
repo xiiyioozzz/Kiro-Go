@@ -14,6 +14,7 @@
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
   const dict = { en: null, zh: null };
   let accountsData = [];
+  let statsData = null;
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
@@ -24,6 +25,7 @@
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
   let iamSession = '';
+  let iamPollTimer = null;
   let exportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
@@ -673,12 +675,165 @@
   async function loadStats() {
     const res = await api('/status');
     const d = await res.json();
-    $('statAccounts').textContent = d.accounts || 0;
+    statsData = d;
+    renderAccountSummaryStats();
     $('statRequests').textContent = d.totalRequests || 0;
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
-    $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+  }
+
+  function isAccountBanStatus(a, status) {
+    return String(a.banStatus || '').toUpperCase() === status;
+  }
+
+  function isAccountBanned(a) {
+    const status = String(a.banStatus || '').toUpperCase();
+    return status && status !== 'ACTIVE';
+  }
+
+  function isAccountTokenExpired(a, nowSec) {
+    return Boolean(a.expiresAt && a.expiresAt < nowSec);
+  }
+
+  function isAccountQuotaBlocked(a) {
+    const syncStatus = a.usageSyncStatus || '';
+    if (syncStatus === 'quota_exhausted') return true;
+    const limit = Number(a.usageLimit || 0);
+    const current = Number(a.usageCurrent || 0);
+    const overageOn = String(a.overageStatus || '').toUpperCase() === 'ENABLED';
+    return limit > 0 && current >= limit && !overageOn;
+  }
+
+  function getAccountBlockingReason(a, nowSec) {
+    const syncStatus = a.usageSyncStatus || '';
+    if (!a.enabled) return 'disabled';
+    if (isAccountBanStatus(a, 'BANNED')) return 'banned';
+    if (isAccountBanStatus(a, 'SUSPENDED')) return 'suspended';
+    if (isAccountBanned(a)) return 'banned';
+    if (!a.hasToken) return 'noToken';
+    if (isAccountTokenExpired(a, nowSec)) return 'expired';
+    if (syncStatus === 'auth_failed') return 'authFailed';
+    if (syncStatus === 'suspended') return 'suspended';
+    if (syncStatus === 'profile_unavailable') return 'profileError';
+    if (isAccountQuotaBlocked(a)) return 'quota';
+    if (syncStatus === 'failed') return 'syncFailed';
+    return '';
+  }
+
+  function buildAccountSummary(statusData) {
+    const nowSec = Date.now() / 1000;
+    const summary = {
+      total: accountsData.length || (statusData && statusData.accounts) || 0,
+      callable: 0,
+      knownGood: 0,
+      unverified: 0,
+      disabled: 0,
+      banned: 0,
+      suspended: 0,
+      noToken: 0,
+      expired: 0,
+      authFailed: 0,
+      quota: 0,
+      profileError: 0,
+      syncFailed: 0,
+      credits: (statusData && statusData.totalCredits) || 0
+    };
+
+    if (!accountsData.length) {
+      summary.callable = (statusData && statusData.available) || 0;
+      return summary;
+    }
+
+    for (const a of accountsData) {
+      if (!a.enabled) summary.disabled++;
+      if (isAccountBanStatus(a, 'BANNED')) summary.banned++;
+      else if (isAccountBanStatus(a, 'SUSPENDED')) summary.suspended++;
+      else if (isAccountBanned(a)) summary.banned++;
+      if (!a.hasToken) summary.noToken++;
+      if (isAccountTokenExpired(a, nowSec)) summary.expired++;
+
+      const syncStatus = a.usageSyncStatus || '';
+      if (syncStatus === 'auth_failed') summary.authFailed++;
+      if (syncStatus === 'suspended' && !isAccountBanStatus(a, 'SUSPENDED')) summary.suspended++;
+      if (syncStatus === 'profile_unavailable') summary.profileError++;
+      if (isAccountQuotaBlocked(a)) summary.quota++;
+      if (syncStatus === 'failed') summary.syncFailed++;
+
+      const blockingReason = getAccountBlockingReason(a, nowSec);
+      if (!blockingReason) {
+        summary.callable++;
+        if (syncStatus === 'success') summary.knownGood++;
+        else summary.unverified++;
+      }
+    }
+
+    return summary;
+  }
+
+  function accountSummaryAriaLabel(summary) {
+    return [
+      t('stats.callable') + ': ' + summary.callable,
+      t('stats.totalAccounts') + ': ' + summary.total,
+      t('stats.credits') + ': ' + summary.credits.toFixed(1)
+    ].join(', ');
+  }
+
+  function accountSummaryPopoverRow(label, value, variant) {
+    const cls = variant ? ' stat-popover-row--' + variant : '';
+    return '<div class="stat-popover-row' + cls + '">' +
+      '<span>' + escapeHtml(label) + '</span>' +
+      '<strong>' + escapeHtml(String(value)) + '</strong>' +
+      '</div>';
+  }
+
+  function accountSummaryPopoverSection(title, rows) {
+    return '<div class="stat-popover-section">' +
+      '<div class="stat-popover-section-title">' + escapeHtml(title) + '</div>' +
+      rows.join('') +
+      '</div>';
+  }
+
+  function accountSummaryPopoverHTML(summary) {
+    const unavailable = Math.max(0, summary.total - summary.callable);
+    return '' +
+      '<div class="stat-popover-head">' +
+      '<div><span>' + escapeHtml(t('stats.callable')) + '</span><strong>' + summary.callable + '/' + summary.total + '</strong></div>' +
+      '<div><span>' + escapeHtml(t('stats.credits')) + '</span><strong>' + summary.credits.toFixed(1) + '</strong></div>' +
+      '</div>' +
+      accountSummaryPopoverSection(t('stats.availabilityGroup'), [
+        accountSummaryPopoverRow(t('stats.knownGood'), summary.knownGood, 'success'),
+        accountSummaryPopoverRow(t('stats.unverified'), summary.unverified, 'muted'),
+        accountSummaryPopoverRow(t('stats.unavailableAccounts'), unavailable, unavailable ? 'danger' : 'muted')
+      ]) +
+      accountSummaryPopoverSection(t('stats.accountStateGroup'), [
+        accountSummaryPopoverRow(t('stats.disabledAccounts'), summary.disabled, summary.disabled ? 'warning' : 'muted'),
+        accountSummaryPopoverRow(t('stats.bannedAccounts'), summary.banned, summary.banned ? 'danger' : 'muted'),
+        accountSummaryPopoverRow(t('stats.suspendedAccounts'), summary.suspended, summary.suspended ? 'danger' : 'muted')
+      ]) +
+      accountSummaryPopoverSection(t('stats.credentialQuotaGroup'), [
+        accountSummaryPopoverRow(t('stats.noTokenAccounts'), summary.noToken, summary.noToken ? 'danger' : 'muted'),
+        accountSummaryPopoverRow(t('stats.expiredAccounts'), summary.expired, summary.expired ? 'warning' : 'muted'),
+        accountSummaryPopoverRow(t('stats.authFailedAccounts'), summary.authFailed, summary.authFailed ? 'danger' : 'muted'),
+        accountSummaryPopoverRow(t('stats.quotaAccounts'), summary.quota, summary.quota ? 'warning' : 'muted'),
+        accountSummaryPopoverRow(t('stats.profileErrorAccounts'), summary.profileError, summary.profileError ? 'danger' : 'muted'),
+        accountSummaryPopoverRow(t('stats.syncFailedAccounts'), summary.syncFailed, summary.syncFailed ? 'warning' : 'muted')
+      ]);
+  }
+
+  function renderAccountSummaryStats() {
+    const summary = buildAccountSummary(statsData);
+    const card = $('statAccountsCard');
+    const tooltip = $('statAccountsTooltip');
+    $('statAccounts').textContent = summary.callable + '/' + summary.total;
+    $('statCredits').textContent = summary.credits.toFixed(1);
+    if (card) {
+      card.removeAttribute('title');
+      card.setAttribute('aria-label', accountSummaryAriaLabel(summary));
+    }
+    if (tooltip) {
+      tooltip.innerHTML = accountSummaryPopoverHTML(summary);
+    }
   }
 
   // ===== Logs =====
@@ -699,6 +854,24 @@
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
+  function formatDateTime(ts) {
+    if (!ts) return '-';
+    const d = new Date(ts * 1000);
+    if (Number.isNaN(d.getTime())) return '-';
+    const pad = n => String(n).padStart(2, '0');
+    return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  function formatFullDateTime(ts) {
+    if (!ts) return t('common.unknown');
+    const d = new Date(ts * 1000);
+    if (Number.isNaN(d.getTime())) return t('common.unknown');
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
   function accountLabel(id) {
     if (!id) return '-';
     const acc = accountsData.find(a => a.id === id);
@@ -706,6 +879,92 @@
       return privacyModeEnabled ? maskEmail(acc.email) : acc.email;
     }
     return id.slice(0, 8);
+  }
+
+  function accountLabelFromLog(log) {
+    if (log && log.accountEmail) {
+      const email = privacyModeEnabled ? maskEmail(log.accountEmail) : log.accountEmail;
+      return log.accountProvider ? email + ' · ' + log.accountProvider : email;
+    }
+    return accountLabel(log && log.accountId);
+  }
+
+  function logSourceLabel(log) {
+    const source = log.source || log.endpoint || '';
+    switch (source) {
+      case 'claude':
+        return t('logs.sourceClaude');
+      case 'openai':
+        return t('logs.sourceOpenAI');
+      case 'responses':
+        return t('logs.sourceResponses');
+      case 'account_test':
+      case 'test':
+        return t('logs.sourceAccountTest');
+      default:
+        return source || '-';
+    }
+  }
+
+  function logEndpointLabel(log) {
+    const endpoint = log.upstreamEndpoint || log.endpoint || '';
+    switch (endpoint) {
+      case 'Kiro IDE':
+      case 'CodeWhisperer':
+      case 'AmazonQ':
+        return endpoint;
+      default:
+        return '-';
+    }
+  }
+
+  function usageSyncStatusLabel(status) {
+    switch (status || '') {
+      case 'success': return t('accounts.usageSyncSuccess');
+      case 'auth_failed': return t('accounts.usageSyncAuthFailed');
+      case 'suspended': return t('accounts.usageSyncSuspended');
+      case 'quota_exhausted': return t('accounts.usageSyncQuota');
+      case 'profile_unavailable': return t('accounts.usageSyncProfile');
+      case 'failed': return t('accounts.usageSyncFailed');
+      default: return t('accounts.usageSyncUnknown');
+    }
+  }
+
+  function usageSyncBadgeClass(status) {
+    switch (status || '') {
+      case 'success': return 'badge-success';
+      case 'quota_exhausted': return 'badge-warning';
+      case 'auth_failed':
+      case 'suspended':
+      case 'profile_unavailable':
+      case 'failed':
+        return 'badge-error';
+      default:
+        return 'badge-muted';
+    }
+  }
+
+  function renderUsageSyncBadge(a) {
+    const status = a.usageSyncStatus || (a.lastRefresh ? 'success' : '');
+    if (!status) return '';
+    return '<span class="badge ' + escapeAttr(usageSyncBadgeClass(status)) + '">' +
+      escapeHtml(usageSyncStatusLabel(status)) + '</span>';
+  }
+
+  function renderUsageSyncLine(a) {
+    const status = a.usageSyncStatus || (a.lastRefresh ? 'success' : '');
+    const checkedAt = a.usageSyncAt || a.lastRefresh;
+    if (!status && !checkedAt && !a.usageSyncError) return '';
+    const parts = [];
+    if (status) parts.push(usageSyncStatusLabel(status));
+    if (checkedAt) parts.push(formatDateTime(checkedAt));
+    if (a.usageSyncError) parts.push(a.usageSyncError);
+    return '<div class="usage-sync-line" title="' + escapeAttr(parts.join(' · ')) + '">' +
+      escapeHtml(t('accounts.usageSyncAt')) + ': ' + escapeHtml(parts.join(' · ')) +
+      '</div>';
+  }
+  function accountRegion(a) {
+    return (a && (a.effectiveRegion || a.region)) || 'us-east-1';
   }
 
   async function loadLogs() {
@@ -743,6 +1002,7 @@
     let html = '<table class="logs-table"><thead><tr>' +
       '<th>' + escapeHtml(t('logs.time')) + '</th>' +
       '<th>' + escapeHtml(t('logs.status')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.source')) + '</th>' +
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
@@ -762,12 +1022,16 @@
       } else {
         detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
       }
+      const accountText = accountLabelFromLog(l);
+      const sourceText = logSourceLabel(l);
+      const endpointText = logEndpointLabel(l);
       html += '<tr>' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
         '<td>' + statusCell + '</td>' +
-        '<td>' + escapeHtml(l.endpoint) + '</td>' +
+        '<td><span title="' + escapeAttr(l.source || l.endpoint || '-') + '">' + escapeHtml(sourceText) + '</span></td>' +
+        '<td><span title="' + escapeAttr(l.upstreamEndpoint || l.endpoint || '-') + '">' + escapeHtml(endpointText) + '</span></td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td><span class="log-account" title="' + escapeAttr(accountText) + '">' + escapeHtml(accountText) + '</span></td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
@@ -798,6 +1062,7 @@
     const res = await api('/accounts');
     accountsData = await res.json();
     renderAccounts();
+    renderAccountSummaryStats();
   }
 
   // Account list
@@ -883,7 +1148,9 @@
     const normalized = String(method).toLowerCase();
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.kiroApiKey');
     if (normalized === 'builderid') return 'BuilderID';
+    if (normalized === 'google/github' || normalized === 'google / github' || normalized === 'kiro sso' || normalized === 'kiro social') return t('modal.socialAuthTitle');
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
@@ -949,6 +1216,7 @@
       const idAttr = escapeAttr(a.id);
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
+      const usageSyncLine = renderUsageSyncLine(a);
 
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
       const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
@@ -967,6 +1235,8 @@
         weightBadge +
         overageBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
+        '<span class="badge badge-muted">' + escapeHtml(accountRegion(a)) + '</span>' +
+        renderUsageSyncBadge(a) +
         getStatusBadge(a) +
         '</div>' +
         '</div>' +
@@ -995,6 +1265,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        usageSyncLine +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
@@ -1046,8 +1317,12 @@
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        if (a.kiroApiKey || a.authMethod === 'api_key') {
+          const { authMethod, provider, region, email, kiroApiKey } = a;
+          return JSON.stringify({ authMethod, provider, region, email, kiroApiKey }, null, 2);
+        }
+        const { clientId, clientSecret, accessToken, refreshToken, authMethod, provider, region, profileArn } = a;
+        return JSON.stringify({ authMethod, provider, region, profileArn, clientId, clientSecret, accessToken, refreshToken }, null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -1122,6 +1397,35 @@
     updateBatchBar();
     loadAccounts();
   }
+  async function batchTestAccounts() {
+    const ids = Array.from(selectedAccounts);
+    if (!ids.length) return;
+    const model = 'claude-sonnet-4';
+    const confirmed = await confirmAction(t('batch.confirmTest', ids.length, model), {
+      title: t('batch.test'),
+      confirmText: t('batch.test')
+    });
+    if (!confirmed) return;
+    const dismiss = toast(t('batch.testing', model), 'info', { duration: 0 });
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      try {
+        const res = await api('/accounts/' + id + '/test', {
+          method: 'POST',
+          body: JSON.stringify({ model })
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.success) ok++; else fail++;
+      } catch {
+        fail++;
+      }
+    }
+    dismiss();
+    toast(t('batch.testResult', ok, fail), fail ? 'warning' : 'success');
+    selectedAccounts.clear();
+    updateBatchBar();
+    loadAccounts(); loadStats(); loadLogs();
+  }
   async function batchDelete() {
     const ids = Array.from(selectedAccounts);
     if (!ids.length) return;
@@ -1181,6 +1485,23 @@
   function detailItem(label, value) {
     return '<div class="detail-item"><div class="detail-label">' + escapeHtml(label) + '</div><div class="detail-value">' + escapeHtml(value) + '</div></div>';
   }
+  function renderRegionEditor(a, idAttr) {
+    const stored = a.region || accountRegion(a);
+    const effective = accountRegion(a);
+    const profileRegion = a.effectiveRegion && a.effectiveRegion !== a.region ? a.effectiveRegion : '';
+    const hint = profileRegion
+      ? t('detail.regionHintWithProfile', stored || '-', profileRegion)
+      : t('detail.regionHint');
+    return '<div class="detail-section"><h4>' + escapeHtml(t('detail.regionSettings')) + '</h4>' +
+      '<div class="machine-id-row">' +
+      '<input type="text" id="regionInput" value="' + escapeAttr(stored || effective) + '" list="regionOptions" placeholder="us-east-1" />' +
+      '<datalist id="regionOptions"><option value="us-east-1"></option><option value="eu-central-1"></option></datalist>' +
+      '<button class="btn btn-sm btn-outline" data-detail-action="detectRegion" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.regionDetect')) + '</button>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveRegion" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
+      '<p class="help-block">' + escapeHtml(hint) + '</p>' +
+      '</div>';
+  }
   function showDetail(id) {
     const a = accountsData.find(x => x.id === id);
     if (!a) return;
@@ -1190,8 +1511,12 @@
       detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
       detailItem(t('detail.userId'), a.userId || '-') +
       detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
-      detailItem(t('detail.region'), a.region || 'us-east-1') +
+      detailItem(t('detail.region'), accountRegion(a)) +
+      detailItem(t('detail.createdAt'), formatFullDateTime(a.createdAt)) +
+      (a.authRegion && a.authRegion !== a.region ? detailItem(t('detail.authRegion'), a.authRegion) : '') +
       '</div></div>' +
+
+      renderRegionEditor(a, idAttr) +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.machineId')) + '</h4><div class="machine-id-row">' +
       '<input type="text" id="machineIdInput" value="' + escapeAttr(a.machineId || '') + '" placeholder="UUID" />' +
@@ -1225,6 +1550,9 @@
       detailItem(t('detail.tokenExpiry'), a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') +
       detailItem(t('detail.mainQuota'), (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0)) +
       detailItem(t('detail.resetDate'), a.nextResetDate || '-') +
+      detailItem(t('detail.usageSyncStatus'), usageSyncStatusLabel(a.usageSyncStatus || (a.lastRefresh ? 'success' : ''))) +
+      detailItem(t('detail.usageSyncAt'), formatDateTime(a.usageSyncAt || a.lastRefresh)) +
+      detailItem(t('detail.usageSyncError'), a.usageSyncError || '-') +
       (a.trialUsageLimit > 0 ?
         detailItem(t('detail.trialQuota'), (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + a.trialUsageLimit.toFixed(0)) +
         detailItem(t('detail.trialStatus'), a.trialStatus || '-') +
@@ -1293,13 +1621,15 @@
       const d = await res.json();
       if (d.success) {
         toast(successMsg, 'success');
-        loadAccounts();
+        await loadAccounts();
+        return true;
       } else {
         toast(t('detail.saveFailed') + (d.error ? ': ' + d.error : ''), 'error');
       }
     } catch (e) {
       toast(t('detail.saveFailed'), 'error');
     }
+    return false;
   }
   async function saveMachineId(id) {
     const m = $('machineIdInput').value.trim();
@@ -1311,6 +1641,28 @@
   async function saveWeight(id) {
     const weight = parseInt($('weightInput').value, 10) || 0;
     await putAccount(id, { weight }, t('detail.saved'));
+  }
+  async function saveRegion(id) {
+    const region = $('regionInput').value.trim();
+    if (!/^[a-z0-9-]{9,32}$/i.test(region) || !region.includes('-')) {
+      toast(t('detail.regionInvalid'), 'warning'); return;
+    }
+    if (await putAccount(id, { region }, t('detail.regionSaved'))) showDetail(id);
+  }
+  async function detectRegion(id) {
+    const dismiss = toast(t('detail.regionDetecting'), 'info', { duration: 0 });
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/region/detect', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      dismiss();
+      if (!res.ok || d.success === false) throw new Error(d.error || t('detail.regionDetectFailed'));
+      toast(t('detail.regionDetected', d.region || ''), 'success');
+      await loadAccounts();
+      showDetail(id);
+    } catch (e) {
+      dismiss();
+      toast(t('detail.regionDetectFailed') + ': ' + ((e && e.message) || e), 'warning');
+    }
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -1527,6 +1879,9 @@
     } catch (e) {
       addTestLog(t('accounts.testLog.error', email, e.message), 'err');
     }
+    try {
+      await Promise.all([loadAccounts(), loadStats(), loadLogs()]);
+    } catch (e) { }
     testModalRunning = false;
     if (modalBtn) modalBtn.removeAttribute('aria-busy');
   }
@@ -2018,19 +2373,25 @@
   }
 
   // Add-account modal templates
-  var METHOD_ICONS = {
-    builderid: 'fa-solid fa-id-card',
-    iam: 'fa-solid fa-key',
-    enterprisesso: 'fa-brands fa-microsoft',
-    sso: 'fa-solid fa-shield-halved',
-    local: 'fa-solid fa-folder-open',
-    credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+  var METHOD_META = {
+    builderid: { icons: ['fa-regular fa-id-card'], tone: 'blue' },
+    socialauth: { icons: ['fa-brands fa-github'], tone: 'slate' },
+    iam: { icons: ['fa-solid fa-shield-halved'], tone: 'orange' },
+    enterprisesso: { icons: ['fa-brands fa-microsoft'], tone: 'sky' },
+    apikey: { icons: ['fa-solid fa-fingerprint'], tone: 'amber' },
+    sso: { icons: ['fa-solid fa-key'], tone: 'green' },
+    local: { icons: ['fa-regular fa-folder-open'], tone: 'violet' },
+    credentials: { icons: ['fa-regular fa-file-code'], tone: 'cyan' },
+    cookie: { icons: ['fa-solid fa-cookie-bite'], tone: 'pink' }
   };
   function methodCard(type, title, desc) {
-    var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
-    return '<button type="button" class="method-card" data-method="' + escapeAttr(type) + '">' +
-      '<span class="method-icon"><i class="' + icon + '" aria-hidden="true"></i></span>' +
+    var meta = METHOD_META[type] || { icons: ['fa-solid fa-circle-plus'], tone: 'blue' };
+    var icons = (meta.icons || ['fa-solid fa-circle-plus']).map(function (icon) {
+      return '<i class="' + escapeAttr(icon) + '" aria-hidden="true"></i>';
+    }).join('');
+    var iconClass = 'method-icon' + ((meta.icons || []).length > 1 ? ' method-icon-duo' : '');
+    return '<button type="button" class="method-card method-card--' + escapeAttr(meta.tone || type) + '" data-method="' + escapeAttr(type) + '">' +
+      '<span class="' + iconClass + '">' + icons + '</span>' +
       '<span class="method-body">' +
       '<span class="method-title">' + escapeHtml(title) + '</span>' +
       '<span class="method-desc">' + escapeHtml(desc) + '</span>' +
@@ -2044,8 +2405,10 @@
     const body = $('modalBody');
     if (type === 'add') modalAdd(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
+    else if (type === 'socialauth') modalSocialAuth(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'enterprisesso') modalEnterpriseSso(title, body);
+    else if (type === 'apikey') modalKiroAPIKey(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
@@ -2056,6 +2419,7 @@
   function closeModal() {
     closeDialog('addModal');
     iamSession = '';
+    if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
     if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
@@ -2072,8 +2436,10 @@
     body.innerHTML =
       '<div class="method-list">' +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
+      methodCard('socialauth', t('modal.socialAuthTitle'), t('modal.socialAuthDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
+      methodCard('apikey', t('modal.kiroApiKeyTitle'), t('modal.kiroApiKeyDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
@@ -2111,8 +2477,11 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.profileRegion')) + '</label><input type="text" id="iamRegion" value="us-east-1" /><small>' + escapeHtml(t('iam.profileRegionHint')) + '</small></div>' +
+      '<label class="export-row iam-open-row"><input type="checkbox" id="iamAutoOpen" /> <span>' + escapeHtml(t('iam.autoOpen')) + '</span></label>' +
+      '<p class="help-block">' + escapeHtml(t('iam.multiAccountHint')) + '</p>' +
       '<div id="iamStep2" class="hidden">' +
+      '<div class="form-group"><label>' + escapeHtml(t('builderid.userCode')) + '</label><div class="code-box" id="iamUserCode"></div></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
       '<div class="endpoint"><span id="iamAuthUrl" class="font-mono text-xs"></span></div>' +
       '<div class="flex gap-2 mt-2">' +
@@ -2120,8 +2489,7 @@
       '<button class="btn btn-sm btn-outline flex-1" id="iamCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '</div>' +
-      '<p class="text-sm mt-3 success-text">' + escapeHtml(t('iam.completeLogin')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.callbackUrl')) + '</label><input type="text" id="iamCallback" placeholder="http://127.0.0.1:xxx/?code=..." /></div>' +
+      '<p id="iamStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
@@ -2208,6 +2576,20 @@
       '</div>';
     $('importCredBtn').addEventListener('click', importCredentials);
   }
+  function modalKiroAPIKey(title, body) {
+    title.textContent = t('modal.kiroApiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.kiroApiKeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiroApiKey.label')) + '</label>' +
+      '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('kiroApiKey.placeholder')) + '"></textarea>' +
+      '<small>' + escapeHtml(t('kiroApiKey.hint')) + '</small></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="kiroApiKeyRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importKiroApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importKiroApiKeyBtn').addEventListener('click', importKiroAPIKey);
+  }
   function modalCookie(title, body) {
     title.textContent = t('modal.cookieTitle');
     body.innerHTML =
@@ -2268,6 +2650,7 @@
       clientId: clientData?.clientId || '',
       clientSecret: clientData?.clientSecret || '',
       region: tokenData.region || '',
+      authRegion: tokenData.authRegion || '',
       authMethod, provider
     };
     const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2277,6 +2660,40 @@
       toastPrimary(t('local.importSuccess') + ': ' + (d.account?.email || d.account?.id));
       autoRefreshNewAccount(d.account?.id);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  async function importKiroAPIKey() {
+    const raw = $('kiroApiKeyInput').value.trim();
+    const region = $('kiroApiKeyRegion').value.trim() || 'us-east-1';
+    if (!raw) return toastWarning(t('kiroApiKey.missing'));
+
+    let key = raw;
+    let email = '';
+    try {
+      const obj = JSON.parse(raw);
+      key = obj.kiroApiKey || obj.kiro_api_key || obj.apiKey || obj.key || '';
+      email = obj.email || '';
+    } catch {
+      // Raw ksk_* value is accepted.
+    }
+    key = String(key || '').trim();
+    if (!key) return toastWarning(t('kiroApiKey.missing'));
+
+    const payload = {
+      authMethod: 'api_key',
+      provider: 'APIKey',
+      kiroApiKey: key,
+      region,
+      ...(email ? { email } : {})
+    };
+    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('kiroApiKey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
   }
   async function importCredentials() {
     const raw = $('credJson').value.trim();
@@ -2291,9 +2708,11 @@
           return {
             refreshToken: c.refreshToken || a.refreshToken,
             accessToken: c.accessToken || a.accessToken,
+            kiroApiKey: c.kiroApiKey || c.kiro_api_key || a.kiroApiKey || a.kiro_api_key,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
-            region: c.region || a.region,
+            region: c.apiRegion || c.region || a.apiRegion || a.region,
+            authRegion: c.authRegion || a.authRegion,
             authMethod: c.authMethod || a.authMethod,
             provider: c.provider || a.provider || a.idp,
             tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
@@ -2302,6 +2721,7 @@
             id: a.id,
             email: c.email || a.email,
             profileArn: c.profileArn || a.profileArn,
+            createdAt: c.createdAt || a.createdAt,
             userId: a.userId
           };
         });
@@ -2323,9 +2743,31 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
       const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
+      const API_KEY_AUTH = ['api_key','apikey'];
       let authMethod = (item.authMethod || '').toLowerCase();
+      const isApiKeyAuth = API_KEY_AUTH.includes(authMethod) || !!item.kiroApiKey || !!item.kiro_api_key;
+      if (isApiKeyAuth) {
+        const kiroApiKey = String(item.kiroApiKey || item.kiro_api_key || (API_KEY_AUTH.includes(authMethod) ? item.accessToken : '') || '').trim();
+        if (!kiroApiKey) { fail++; continue; }
+        const payload = {
+          authMethod: 'api_key',
+          provider: item.provider || 'APIKey',
+          kiroApiKey,
+          region: item.region || 'us-east-1',
+          ...(item.id ? { id: item.id } : {}),
+          ...(item.email ? { email: item.email } : {}),
+          ...(item.createdAt ? { createdAt: item.createdAt } : {})
+        };
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch { fail++; }
+        continue;
+      }
+      if (!item.refreshToken) { fail++; continue; }
       if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
         authMethod = 'external_idp';
       } else if (item.clientId && item.clientSecret) {
@@ -2346,12 +2788,14 @@
         clientSecret: item.clientSecret || '',
         authMethod, provider,
         region: item.region || 'us-east-1',
+        authRegion: item.authRegion || '',
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
         scopes: item.scopes || '',
         ...(item.id ? { id: item.id } : {}),
         ...(item.email ? { email: item.email } : {}),
-        ...(item.profileArn ? { profileArn: item.profileArn } : {})
+        ...(item.profileArn ? { profileArn: item.profileArn } : {}),
+        ...(item.createdAt ? { createdAt: item.createdAt } : {})
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2464,6 +2908,34 @@
     builderIdSession = '';
     showModal('add');
   }
+  // Google / GitHub uses Kiro's hosted sign-in page without an organization hint.
+  // That keeps the browser on the normal social OAuth choice instead of forcing
+  // the enterprise organization lookup leg.
+  function modalSocialAuth(title, body) {
+    title.textContent = t('modal.socialAuthTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.socialAuthDesc')) + '</p>' +
+      '<div id="kiroSsoStep1">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroSocialBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="kiroSsoStep2" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.openInstruction')) + '</p></div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<div class="endpoint"><span id="kiroSsoSignInUrl" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>';
+    $('startKiroSocialBtn').addEventListener('click', function () { startKiroSsoLogin('social'); });
+  }
   // Enterprise SSO — Microsoft 365 / Entra ID (Azure AD), via the Kiro hosted sign-in portal.
   // The backend binds a loopback listener and returns the sign-in URL; the browser is driven
   // through the external-IdP leg automatically, and we poll until the account is created.
@@ -2473,6 +2945,10 @@
       '<p class="help-block">' + escapeHtml(t('modal.enterpriseSsoDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
+      '<div class="form-group">' +
+      '<label>' + escapeHtml(t('kirosso.emailLabel')) + ' <small>' + escapeHtml(t('kirosso.emailHint')) + '</small></label>' +
+      '<input type="text" id="kiroSsoLoginHint" autocomplete="email" placeholder="' + escapeAttr(t('kirosso.emailPlaceholder')) + '" />' +
+      '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSsoBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
@@ -2490,13 +2966,15 @@
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
-    $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+    $('startKiroSsoBtn').addEventListener('click', function () { startKiroSsoLogin('enterprise'); });
   }
-  async function startKiroSsoLogin() {
+  async function startKiroSsoLogin(mode) {
     // No region prompt: the data-plane region is derived from the profile ARN
     // returned by SSO (social) or discovered via the cross-region profile probe
     // (external_idp / Azure), so the operator never has to know it up front.
-    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
+    const loginHint = mode === 'social' ? '' : ($('kiroSsoLoginHint')?.value || '').trim();
+    const payload = loginHint ? { loginHint } : {};
+    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {
       kiroSsoSession = d.sessionId;
@@ -2545,37 +3023,58 @@
     showModal('add');
   }
   async function startIamSso() {
-    if (iamSession) {
-      const res = await api('/auth/iam-sso/complete', {
-        method: 'POST', body: JSON.stringify({
-          sessionId: iamSession, callbackUrl: $('iamCallback').value
-        })
+    const res = await api('/auth/iam-sso/start', {
+      method: 'POST', body: JSON.stringify({
+        startUrl: $('iamStartUrl').value, region: $('iamRegion').value
+      })
+    });
+    const d = await res.json();
+    if (d.sessionId && d.verificationUri) {
+      iamSession = d.sessionId;
+      $('iamUserCode').textContent = d.userCode || '';
+      $('iamAuthUrl').textContent = d.verificationUri;
+      $('iamStep2').classList.remove('hidden');
+      $('iamBtn').disabled = true;
+      $('iamBtn').textContent = t('builderid.waiting');
+      const profileRegion = d.region || $('iamRegion').value || '';
+      const authRegion = d.authRegion || profileRegion;
+      let waitingText = t('builderid.waiting');
+      if (profileRegion && authRegion && profileRegion !== authRegion) {
+        waitingText += ' · ' + t('iam.regionStatus', profileRegion, authRegion);
+      } else if (profileRegion) {
+        waitingText += ' · ' + profileRegion;
+      }
+      $('iamStatus').dataset.waitingText = waitingText;
+      $('iamStatus').textContent = waitingText;
+      $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
+      $('iamCopyBtn').addEventListener('click', async () => {
+        await copyText($('iamAuthUrl').textContent);
+        toast(t('common.copied'), 'primary');
       });
+      if ($('iamAutoOpen')?.checked) {
+        window.open(d.verificationUri, '_blank');
+      }
+      pollIamSsoAuth(d.interval || 5);
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  function pollIamSsoAuth(interval) {
+    iamPollTimer = setTimeout(async () => {
+      const res = await api('/auth/iam-sso/poll', { method: 'POST', body: JSON.stringify({ sessionId: iamSession }) });
       const d = await res.json();
-      if (d.success) {
+      if (d.completed) {
+        iamSession = '';
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
         autoRefreshNewAccount(d.account?.id);
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
-    } else {
-      const res = await api('/auth/iam-sso/start', {
-        method: 'POST', body: JSON.stringify({
-          startUrl: $('iamStartUrl').value, region: $('iamRegion').value
-        })
-      });
-      const d = await res.json();
-      if (d.authorizeUrl) {
-        iamSession = d.sessionId;
-        $('iamAuthUrl').textContent = d.authorizeUrl;
-        $('iamStep2').classList.remove('hidden');
-        $('iamBtn').textContent = t('iam.complete');
-        $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
-        $('iamCopyBtn').addEventListener('click', async () => {
-          await copyText($('iamAuthUrl').textContent);
-          toast(t('common.copied'), 'primary');
-        });
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
-    }
+      } else if (d.success && !d.completed) {
+        $('iamStatus').textContent = $('iamStatus').dataset.waitingText || t('builderid.waiting');
+        pollIamSsoAuth(d.interval || interval);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+        if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
+        iamSession = '';
+      }
+    }, interval * 1000);
   }
   async function autoRefreshNewAccount(id) {
     if (!id) return;
@@ -2893,6 +3392,7 @@
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
       if (a === 'refreshModels') batchRefreshModels();
+      else if (a === 'test') batchTestAccounts();
       else if (a === 'delete') batchDelete();
       else batchAction(a);
     }));
@@ -2982,13 +3482,15 @@
   function bindDetailEvents() {
     $('detailBody').addEventListener('click', e => {
       if (e.target.id === 'generateMachineIdBtn') { generateMachineId(); return; }
-      const b = e.target.closest('[data-detail-action]');
-      if (!b) return;
-      const id = b.dataset.id;
-      const a = b.dataset.detailAction;
-      if (a === 'saveMachineId') saveMachineId(id);
-      else if (a === 'saveWeight') saveWeight(id);
-      else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
+	      const b = e.target.closest('[data-detail-action]');
+	      if (!b) return;
+	      const id = b.dataset.id;
+	      const a = b.dataset.detailAction;
+	      if (a === 'saveMachineId') saveMachineId(id);
+	      else if (a === 'saveWeight') saveWeight(id);
+	      else if (a === 'saveRegion') saveRegion(id);
+	      else if (a === 'detectRegion') detectRegion(id);
+	      else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);

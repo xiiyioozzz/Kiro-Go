@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,14 @@ const (
 	// the browser resolving "localhost" to either loopback address is what bridges
 	// the two, so the operator's host must resolve localhost to loopback.
 	kiroRedirectURI = "http://localhost:3128"
+	// kiroDirectCallbackBaseURL is used only for the optional direct enterprise
+	// descriptor hop. It bypasses the hosted sign-in page after Kiro's public
+	// GetLoginMetadata endpoint has resolved the organization, so it does not need
+	// to match a registered OAuth redirect URI. Using 127.0.0.1 avoids a class of
+	// browser/proxy issues where "localhost" is intercepted before the Microsoft
+	// tab is opened. The subsequent Microsoft redirect_uri still uses
+	// kiroRedirectURI, because that value is what the IdP application accepts.
+	kiroDirectCallbackBaseURL = "http://127.0.0.1:3128"
 	// kiroRedirectPort is the loopback port embedded in kiroRedirectURI.
 	kiroRedirectPort = "3128"
 	// kiroRedirectFrom mirrors the Kiro IDE client tag the portal expects.
@@ -71,8 +80,22 @@ const (
 	// (socialTokenURL() in oidc.go -> /refreshToken): the Kiro IDE exchanges the
 	// login code at /oauth/token and refreshes at /refreshToken. Do not unify them.
 	kiroSocialTokenURL = "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token"
+	// kiroLoginMetadataTarget is the AWS JSON RPC operation the hosted sign-in page
+	// calls after the operator enters an organization email. We use the same
+	// operation for the optional direct enterprise path.
+	kiroLoginMetadataTarget = "KiroWebPortalService.GetLoginMetadata"
 	// kiroSsoLoginTimeout bounds how long the listener waits for the user.
 	kiroSsoLoginTimeout = 10 * time.Minute
+)
+
+var kiroLoginMetadataURL = func() string {
+	return "https://app.kiro.dev/getLoginMetadata/"
+}
+
+var (
+	kiroEmailLikeRE = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+	kiroDomainRE    = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z](?:[A-Za-z-]*[A-Za-z])?)+$`)
+	kiroProfileRE   = regexp.MustCompile(`^(kiro\.dev|kiro\.awshome\.(?:hci\.)?ic\.gov|kiro\.awshome\.scloud)/[A-Za-z0-9][A-Za-z0-9_-]*$`)
 )
 
 // allowedExternalIdpIssuerSuffixes restricts which IdP issuer/endpoint hosts the
@@ -158,9 +181,27 @@ var (
 	kiroSsoSessionsMu sync.RWMutex
 )
 
+type kiroLoginMetadata struct {
+	Audience  string   `json:"audience"`
+	ClientID  string   `json:"clientId"`
+	Found     bool     `json:"found"`
+	IssuerURL string   `json:"issuerUrl"`
+	Scopes    []string `json:"scopes"`
+}
+
 // StartKiroSsoLogin generates PKCE codes, binds the loopback listener, and
 // returns the session plus the hosted sign-in URL the operator must open.
 func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
+	return StartKiroSsoLoginWithHint(region, "")
+}
+
+// StartKiroSsoLoginWithHint is the same login flow with an optional enterprise
+// email/domain hint. When the hint is present, Kiro-Go calls the public
+// GetLoginMetadata operation directly and returns a local descriptor callback URL;
+// opening it immediately redirects the browser to Microsoft. This bypasses the
+// hosted sign-in page's organization lookup UI, which can get stuck in some
+// browser/proxy states.
+func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, string, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -190,6 +231,14 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 	params.Set("redirect_uri", kiroRedirectURI)
 	params.Set("redirect_from", kiroRedirectFrom)
 	signInURL := kiroSignInBaseURL + "?" + params.Encode()
+	if strings.TrimSpace(loginHint) != "" {
+		directURL, err := session.directExternalIdpDescriptorURL(loginHint)
+		if err != nil {
+			session.close()
+			return nil, "", err
+		}
+		signInURL = directURL
+	}
 
 	kiroSsoSessionsMu.Lock()
 	kiroSsoSessions[session.ID] = session
@@ -206,6 +255,94 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 	})
 
 	return session, signInURL, nil
+}
+
+func (s *KiroSsoSession) directExternalIdpDescriptorURL(rawHint string) (string, error) {
+	domainName, loginHint, err := normalizeKiroLoginMetadataDomain(rawHint)
+	if err != nil {
+		return "", err
+	}
+	meta, err := fetchKiroLoginMetadata(GetAuthClientForProxy(s.ProxyURL), domainName)
+	if err != nil {
+		return "", err
+	}
+	if !meta.Found {
+		return "", fmt.Errorf("no Kiro organization found for %q", domainName)
+	}
+	if strings.TrimSpace(meta.ClientID) == "" || strings.TrimSpace(meta.IssuerURL) == "" || len(meta.Scopes) == 0 {
+		return "", fmt.Errorf("Kiro organization metadata for %q is incomplete", domainName)
+	}
+	return buildKiroExternalIdpDescriptorURL(s.State, loginHint, meta), nil
+}
+
+func normalizeKiroLoginMetadataDomain(raw string) (domainName, loginHint string, err error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", "", fmt.Errorf("email or domain is empty")
+	}
+	loginHint = value
+	clean := strings.TrimSpace(value)
+	clean = strings.TrimPrefix(clean, "http://")
+	clean = strings.TrimPrefix(clean, "https://")
+	clean = strings.Trim(clean, "/")
+	cleanLower := strings.ToLower(clean)
+
+	if strings.Contains(cleanLower, "@") {
+		if !kiroEmailLikeRE.MatchString(cleanLower) {
+			return "", "", fmt.Errorf("invalid organization email %q", value)
+		}
+		parts := strings.Split(cleanLower, "@")
+		cleanLower = parts[len(parts)-1]
+	} else {
+		loginHint = ""
+	}
+
+	if kiroDomainRE.MatchString(cleanLower) || kiroProfileRE.MatchString(cleanLower) {
+		return cleanLower, loginHint, nil
+	}
+	return "", "", fmt.Errorf("invalid Kiro organization domain %q", value)
+}
+
+func fetchKiroLoginMetadata(client *http.Client, domainName string) (kiroLoginMetadata, error) {
+	payload, _ := json.Marshal(map[string]string{"domainName": domainName})
+	req, err := http.NewRequest(http.MethodPost, kiroLoginMetadataURL(), bytes.NewReader(payload))
+	if err != nil {
+		return kiroLoginMetadata{}, fmt.Errorf("failed to build Kiro organization lookup request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Amz-Target", kiroLoginMetadataTarget)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return kiroLoginMetadata{}, fmt.Errorf("Kiro organization lookup failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var out kiroLoginMetadata
+	_ = json.Unmarshal(respBody, &out)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return kiroLoginMetadata{}, fmt.Errorf("Kiro organization lookup failed (status %d): %s", resp.StatusCode, string(respBody))
+	}
+	return out, nil
+}
+
+func buildKiroExternalIdpDescriptorURL(state, loginHint string, meta kiroLoginMetadata) string {
+	u, _ := url.Parse(kiroDirectCallbackBaseURL + "/signin/callback")
+	q := u.Query()
+	q.Set("login_option", "external_idp")
+	q.Set("issuer_url", strings.TrimSpace(meta.IssuerURL))
+	q.Set("client_id", strings.TrimSpace(meta.ClientID))
+	q.Set("state", state)
+	q.Set("scopes", strings.Join(meta.Scopes, " "))
+	if strings.TrimSpace(loginHint) != "" {
+		q.Set("login_hint", strings.TrimSpace(loginHint))
+	}
+	if strings.TrimSpace(meta.Audience) != "" {
+		q.Set("audience", strings.TrimSpace(meta.Audience))
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // PollKiroSsoAuth reports the login status. It returns ("pending", nil) until the
@@ -276,7 +413,7 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 		AccessToken:  access,
 		RefreshToken: refresh,
 		AuthMethod:   "social",
-		Provider:     "Kiro SSO",
+		Provider:     "Google/GitHub",
 		ProfileArn:   profileArn,
 		Region:       s.Region,
 		ExpiresIn:    expiresIn,
@@ -828,4 +965,3 @@ func removeKiroSsoSession(sessionID string) {
 	delete(kiroSsoSessions, sessionID)
 	kiroSsoSessionsMu.Unlock()
 }
-

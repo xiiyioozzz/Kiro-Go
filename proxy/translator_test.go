@@ -409,6 +409,7 @@ func TestParseModelAndThinking(t *testing.T) {
 		// Format normalization: dash → dot for new versions without code changes.
 		{"new opus dash form", "claude-opus-4-8", "claude-opus-4.8", false},
 		{"new opus dot form", "claude-opus-4.8", "claude-opus-4.8", false},
+		{"capitalized opus dot form", "Claude-opus-4.8", "claude-opus-4.8", false},
 		{"existing opus dash form", "claude-opus-4-7", "claude-opus-4.7", false},
 		{"existing opus dot form", "claude-opus-4.7", "claude-opus-4.7", false},
 		{"sonnet dash form", "claude-sonnet-4-6", "claude-sonnet-4.6", false},

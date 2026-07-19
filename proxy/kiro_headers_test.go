@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"kiro-go/config"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -39,5 +40,29 @@ func TestBuildRuntimeHeaderValuesUsesRuntimeAPIFormat(t *testing.T) {
 	}
 	if !strings.Contains(values.UserAgent, "m/N,E") {
 		t.Fatalf("expected runtime mode marker in user agent, got %q", values.UserAgent)
+	}
+}
+
+func TestApplyKiroBaseHeadersUsesKiroAPIKeyTokenType(t *testing.T) {
+	req := httptest.NewRequest("POST", "https://q.us-east-1.amazonaws.com/", nil)
+	account := &config.Account{
+		AuthMethod: "api_key",
+		KiroAPIKey: "ksk_test_key",
+	}
+
+	applyKiroBaseHeaders(req, account, kiroHeaderValues{
+		UserAgent:    "ua",
+		AmzUserAgent: "amz",
+		Host:         "q.us-east-1.amazonaws.com",
+	})
+
+	if got := req.Header.Get("Authorization"); got != "Bearer ksk_test_key" {
+		t.Fatalf("expected API key bearer token, got %q", got)
+	}
+	if got := req.Header.Get("TokenType"); got != "API_KEY" {
+		t.Fatalf("expected API_KEY token type, got %q", got)
+	}
+	if req.Host != "q.us-east-1.amazonaws.com" {
+		t.Fatalf("expected req.Host override, got %q", req.Host)
 	}
 }

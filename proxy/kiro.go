@@ -23,10 +23,12 @@ import (
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
 type kiroEndpoint struct {
-	URL       string
-	Origin    string
-	AmzTarget string
-	Name      string
+	URL         string
+	Origin      string
+	AmzTarget   string
+	Name        string
+	ContentType string
+	CLI         bool
 }
 
 var kiroEndpoints = []kiroEndpoint{
@@ -48,6 +50,15 @@ var kiroEndpoints = []kiroEndpoint{
 		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
 		Name:      "AmazonQ",
 	},
+}
+
+var kiroCLIEndpoint = kiroEndpoint{
+	URL:         "https://q.us-east-1.amazonaws.com/",
+	Origin:      "KIRO_CLI",
+	AmzTarget:   "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+	Name:        "Kiro CLI",
+	ContentType: "application/x-amz-json-1.0",
+	CLI:         true,
 }
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
@@ -239,12 +250,17 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	OnEndpoint     func(name string)
 }
 
 // ==================== API Call ====================
 
 func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Account) {
 	if payload == nil {
+		return
+	}
+	if config.IsAPIKeyAccount(account) {
+		payload.ProfileArn = ""
 		return
 	}
 
@@ -288,6 +304,44 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
+func getSortedEndpointsForAccount(account *config.Account, preferred string) []kiroEndpoint {
+	if config.IsAPIKeyAccount(account) {
+		return []kiroEndpoint{kiroCLIEndpoint}
+	}
+	return getSortedEndpoints(preferred)
+}
+
+func buildKiroRequestBody(payload *KiroPayload, ep kiroEndpoint) ([]byte, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("payload is nil")
+	}
+
+	var out KiroPayload
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+
+	out.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	if ep.CLI {
+		out.ProfileArn = ""
+		out.ConversationState.AgentContinuationId = ""
+		for i := range out.ConversationState.History {
+			msg := out.ConversationState.History[i].UserInputMessage
+			if msg == nil {
+				continue
+			}
+			msg.Origin = ep.Origin
+			msg.ModelID = ""
+		}
+	}
+
+	return json.Marshal(&out)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -322,7 +376,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+	if !config.IsAPIKeyAccount(account) && payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -333,17 +387,22 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	endpoints := getSortedEndpointsForAccount(account, config.GetPreferredEndpoint())
 
 	var lastErr error
 	for _, ep := range endpoints {
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+		if callback != nil && callback.OnEndpoint != nil {
+			callback.OnEndpoint(ep.Name)
+		}
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 
-		reqBody, _ := json.Marshal(payload)
+		reqBody, err := buildKiroRequestBody(payload, ep)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err
@@ -355,15 +414,26 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			host = parsedURL.Host
 		}
 		headerValues := buildStreamingHeaderValues(account, host)
+		if ep.CLI {
+			headerValues = buildCLIStreamingHeaderValues(account, host)
+		}
 
-		req.Header.Set("Content-Type", "application/json")
+		contentType := ep.ContentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("Accept", "*/*")
 		if ep.AmzTarget != "" {
 			req.Header.Set("X-Amz-Target", ep.AmzTarget)
 		}
 		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		if ep.CLI {
+			req.Header.Set("x-amzn-codewhisperer-optout", "false")
+		} else {
+			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+			req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		}
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 

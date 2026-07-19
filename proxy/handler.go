@@ -21,19 +21,32 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time             int64   `json:"time"`     // Unix timestamp
+	Source           string  `json:"source"`   // claude/openai/responses/account_test
+	Endpoint         string  `json:"endpoint"` // Actual upstream endpoint: Kiro IDE/CodeWhisperer/AmazonQ
+	UpstreamEndpoint string  `json:"upstreamEndpoint,omitempty"`
+	Model            string  `json:"model"`           // Requested model
+	AccountID        string  `json:"accountId"`       // Account used
+	AccountEmail     string  `json:"accountEmail"`    // Account email snapshot for display
+	AccountProvider  string  `json:"accountProvider"` // Provider snapshot for display
+	Status           string  `json:"status"`          // "success" or "error"
+	Error            string  `json:"error"`           // Error message (empty on success)
+	ErrorType        string  `json:"errorType"`       // Error category (empty on success)
+	Tokens           int     `json:"tokens"`          // Total tokens (input+output, 0 on failure)
+	Credits          float64 `json:"credits"`         // Credits consumed (0 on failure)
+	Duration         int64   `json:"duration"`        // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
+
+func writeAddAccountError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if config.IsDuplicateAccountError(err) {
+		status = http.StatusConflict
+	}
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -374,13 +387,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 路由
 	switch {
 	// API 端点（需要验证 API Key）
-	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
+	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages" || path == "/v1/messages/v1/messages":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
 		}
 		h.handleClaudeMessages(w, ar)
-	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
+	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens" || path == "/v1/messages/v1/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
@@ -863,6 +876,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -891,6 +906,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -903,6 +919,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamEndpoint string
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1213,17 +1230,21 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastUpstreamEndpoint = upstreamEndpoint
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.recordFailureWithDetails("claude", upstreamEndpoint, model, account.ID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1256,7 +1277,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1283,7 +1304,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1356,7 +1377,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+func (h *Handler) recordFailureWithDetails(source, upstreamEndpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -1366,34 +1387,60 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 
 	errMsg := err.Error()
 	errType := classifyError(errMsg)
+	accountEmail, accountProvider := requestLogAccountSnapshot(accountID)
 
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "error",
-		Error:     errMsg,
-		ErrorType: errType,
+		Time:             time.Now().Unix(),
+		Source:           source,
+		Endpoint:         upstreamEndpoint,
+		UpstreamEndpoint: upstreamEndpoint,
+		Model:            model,
+		AccountID:        accountID,
+		AccountEmail:     accountEmail,
+		AccountProvider:  accountProvider,
+		Status:           "error",
+		Error:            errMsg,
+		ErrorType:        errType,
 	}
 
 	h.appendRequestLog(entry)
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+func (h *Handler) recordSuccessLog(source, upstreamEndpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+	accountEmail, accountProvider := requestLogAccountSnapshot(accountID)
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+		Time:             time.Now().Unix(),
+		Source:           source,
+		Endpoint:         upstreamEndpoint,
+		UpstreamEndpoint: upstreamEndpoint,
+		Model:            model,
+		AccountID:        accountID,
+		AccountEmail:     accountEmail,
+		AccountProvider:  accountProvider,
+		Status:           "success",
+		Tokens:           tokens,
+		Credits:          credits,
+		Duration:         durationMs,
 	}
 
 	h.appendRequestLog(entry)
+}
+
+func requestLogAccountSnapshot(accountID string) (string, string) {
+	if accountID == "" {
+		return "", ""
+	}
+	for _, account := range config.GetAccounts() {
+		if account.ID == accountID {
+			provider := account.Provider
+			if provider == "" {
+				provider = account.AuthMethod
+			}
+			return account.Email, provider
+		}
+	}
+	return "", ""
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1444,6 +1491,8 @@ func (h *Handler) getRequestLogs() []RequestLog {
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1451,6 +1500,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1465,6 +1515,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamEndpoint string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1487,11 +1538,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastUpstreamEndpoint = upstreamEndpoint
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1518,7 +1573,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1558,7 +1613,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1631,6 +1686,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1638,6 +1695,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1650,6 +1708,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamEndpoint string
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -1924,17 +1983,21 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastUpstreamEndpoint = upstreamEndpoint
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.recordFailureWithDetails("openai", upstreamEndpoint, model, account.ID, err)
 			return
 		}
 
@@ -1965,7 +2028,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2000,7 +2063,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2008,6 +2071,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
+	var lastUpstreamEndpoint string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2015,6 +2080,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		lastAccountID = account.ID
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2028,6 +2094,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamEndpoint string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2043,11 +2110,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnEndpoint: func(name string) {
+				upstreamEndpoint = name
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastUpstreamEndpoint = upstreamEndpoint
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -2070,7 +2141,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", upstreamEndpoint, model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2084,7 +2155,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", lastUpstreamEndpoint, model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2101,6 +2172,19 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	if config.IsAPIKeyAccount(account) {
+		apiKey := strings.TrimSpace(account.KiroAPIKey)
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(account.AccessToken)
+		}
+		if apiKey == "" {
+			return fmt.Errorf("Kiro API Key is empty")
+		}
+		account.KiroAPIKey = apiKey
+		account.AccessToken = apiKey
+		account.ExpiresAt = 0
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2132,8 +2216,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	}
 	account.ExpiresAt = expiresAt
 	if profileArn != "" {
-		account.ProfileArn = profileArn
-		config.UpdateAccountProfileArn(account.ID, profileArn)
+		cacheResolvedProfileArn(account, profileArn)
 	}
 
 	// 持久化
@@ -2176,6 +2259,9 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
 		h.apiRefreshAccountModels(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/region/detect") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/region/detect")
+		h.apiDetectAccountRegion(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2205,8 +2291,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateAccount(w, r, strings.TrimPrefix(path, "/accounts/"))
 	case path == "/auth/iam-sso/start" && r.Method == "POST":
 		h.apiStartIamSso(w, r)
-	case path == "/auth/iam-sso/complete" && r.Method == "POST":
-		h.apiCompleteIamSso(w, r)
+	case path == "/auth/iam-sso/poll" && r.Method == "POST":
+		h.apiPollIamSso(w, r)
 	case path == "/auth/builderid/start" && r.Method == "POST":
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
@@ -2297,15 +2383,19 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"email":             a.Email,
 			"userId":            a.UserId,
 			"nickname":          a.Nickname,
+			"createdAt":         a.CreatedAt,
 			"authMethod":        a.AuthMethod,
 			"provider":          a.Provider,
 			"region":            a.Region,
+			"authRegion":        a.AuthRegion,
+			"effectiveRegion":   effectiveAccountRegion(&a),
 			"enabled":           a.Enabled,
 			"banStatus":         a.BanStatus,
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
-			"hasToken":          a.AccessToken != "",
+			"hasToken":          accountBearerToken(&a) != "",
+			"hasKiroApiKey":     strings.TrimSpace(a.KiroAPIKey) != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -2323,6 +2413,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"usagePercent":      a.UsagePercent,
 			"nextResetDate":     a.NextResetDate,
 			"lastRefresh":       a.LastRefresh,
+			"usageSyncStatus":   a.UsageSyncStatus,
+			"usageSyncError":    a.UsageSyncError,
+			"usageSyncAt":       a.UsageSyncAt,
 			"trialUsageCurrent": a.TrialUsageCurrent,
 			"trialUsageLimit":   a.TrialUsageLimit,
 			"trialUsagePercent": a.TrialUsagePercent,
@@ -2350,12 +2443,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.ID = auth.GenerateAccountID()
 	}
 	if account.Region == "" {
+		account.Region = regionFromProfileArn(account.ProfileArn)
+	}
+	if account.Region == "" {
 		account.Region = "us-east-1"
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeAddAccountError(w, err)
 		return
 	}
 
@@ -2421,6 +2516,37 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
 	}
+	if v, ok := updates["region"].(string); ok {
+		region, regionErr := normalizeRegionInput(v)
+		if regionErr != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": regionErr.Error()})
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(existing.Region), region) {
+			if strings.EqualFold(strings.TrimSpace(existing.AuthMethod), "idc") && strings.TrimSpace(existing.AuthRegion) == "" {
+				existing.AuthRegion = strings.TrimSpace(existing.Region)
+			}
+			existing.Region = region
+			existing.ProfileArn = ""
+			existing.UsageSyncStatus = ""
+			existing.UsageSyncError = ""
+			existing.UsageSyncAt = 0
+		}
+	}
+	if v, ok := updates["authRegion"].(string); ok {
+		authRegion := strings.TrimSpace(v)
+		if authRegion != "" {
+			normalizedAuthRegion, regionErr := normalizeRegionInput(authRegion)
+			if regionErr != nil {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": regionErr.Error()})
+				return
+			}
+			authRegion = normalizedAuthRegion
+		}
+		existing.AuthRegion = authRegion
+	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
 		w.WriteHeader(500)
@@ -2438,6 +2564,90 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		}(*existing)
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func normalizeRegionInput(region string) (string, error) {
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "" {
+		return "", fmt.Errorf("region is required")
+	}
+	if len(region) < 9 || len(region) > 32 || !strings.Contains(region, "-") {
+		return "", fmt.Errorf("invalid region")
+	}
+	for _, ch := range region {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return "", fmt.Errorf("invalid region")
+	}
+	return region, nil
+}
+
+func effectiveAccountRegion(account *config.Account) string {
+	if account != nil {
+		if profileRegion := regionFromProfileArn(account.ProfileArn); profileRegion != "" {
+			return profileRegion
+		}
+		if region := strings.TrimSpace(account.Region); region != "" {
+			return region
+		}
+	}
+	return "us-east-1"
+}
+
+func (h *Handler) apiDetectAccountRegion(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+	}
+	if err := h.ensureValidToken(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
+	}
+	account.ProfileArn = ""
+	profileArn, err := detectProfileArnAcrossRegions(account)
+	if err != nil || strings.TrimSpace(profileArn) == "" {
+		w.WriteHeader(500)
+		msg := "no available Kiro profile"
+		if err != nil {
+			msg = err.Error()
+		}
+		json.NewEncoder(w).Encode(map[string]string{"error": msg})
+		return
+	}
+	detectedRegion := regionFromProfileArn(profileArn)
+	if detectedRegion == "" {
+		detectedRegion = effectiveAccountRegion(account)
+	}
+	account.ProfileArn = profileArn
+	account.Region = detectedRegion
+	if err := config.UpdateAccountProfileArnAndRegion(id, profileArn, detectedRegion); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"region":     detectedRegion,
+		"profileArn": profileArn,
+	})
 }
 
 // apiGetAccountOverage 拉取并返回单个账号的上游 Overages 状态。
@@ -2653,7 +2863,7 @@ func (h *Handler) apiStartIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, authorizeUrl, expiresIn, err := auth.StartIamSsoLogin(req.StartUrl, req.Region)
+	session, err := auth.StartIamSsoLogin(req.StartUrl, req.Region)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -2661,16 +2871,18 @@ func (h *Handler) apiStartIamSso(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sessionId":    sessionID,
-		"authorizeUrl": authorizeUrl,
-		"expiresIn":    expiresIn,
+		"sessionId":       session.ID,
+		"userCode":        session.UserCode,
+		"verificationUri": session.VerificationUri,
+		"interval":        session.Interval,
+		"region":          session.Region,
+		"authRegion":      session.AuthRegion,
 	})
 }
 
-func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiPollIamSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SessionID   string `json:"sessionId"`
-		CallbackUrl string `json:"callbackUrl"`
+		SessionID string `json:"sessionId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2678,10 +2890,27 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, err := auth.CompleteIamSsoLogin(req.SessionID, req.CallbackUrl)
+	accessToken, refreshToken, clientID, clientSecret, region, authRegion, startUrl, expiresIn, status, err := auth.PollIamSsoAuth(req.SessionID)
 	if err != nil {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if status == "pending" || status == "slow_down" {
+		interval := 5
+		if session := auth.GetIamSsoSession(req.SessionID); session != nil {
+			interval = session.Interval
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    status,
+			"interval":  interval,
+		})
 		return
 	}
 
@@ -2697,21 +2926,24 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		AuthMethod:   "idc",
+		Provider:     "Enterprise",
 		Region:       region,
+		AuthRegion:   authRegion,
+		StartUrl:     startUrl,
 		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
 		Enabled:      true,
 		MachineId:    config.GenerateMachineId(),
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeAddAccountError(w, err)
 		return
 	}
 
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
+		"success":   true,
+		"completed": true,
 		"account": map[string]interface{}{
 			"id":    account.ID,
 			"email": account.Email,
@@ -2795,8 +3027,7 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeAddAccountError(w, err)
 		return
 	}
 
@@ -2818,14 +3049,15 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 // leg automatically; the front end polls /auth/kiro-sso/poll until completion.
 func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Region string `json:"region"`
+		Region    string `json:"region"`
+		LoginHint string `json:"loginHint"`
 	}
 	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
 	// error (including an empty body) is intentionally tolerated — mirrors
 	// apiStartBuilderIdLogin.
 	json.NewDecoder(r.Body).Decode(&req)
 
-	session, signInURL, err := auth.StartKiroSsoLogin(req.Region)
+	session, signInURL, err := auth.StartKiroSsoLoginWithHint(req.Region, req.LoginHint)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -2907,8 +3139,7 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeAddAccountError(w, err)
 		return
 	}
 
@@ -3014,11 +3245,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
+		KiroAPIKey   string `json:"kiroApiKey"`
 		ClientID     string `json:"clientId"`
 		ClientSecret string `json:"clientSecret"`
 		AuthMethod   string `json:"authMethod"`
 		Provider     string `json:"provider"`
 		Region       string `json:"region"`
+		AuthRegion   string `json:"authRegion"`
 		// external_idp (enterprise SSO / Azure AD) refresh material.
 		TokenEndpoint string `json:"tokenEndpoint"`
 		IssuerURL     string `json:"issuerUrl"`
@@ -3027,6 +3260,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		ID         string `json:"id"`
 		Email      string `json:"email"`
 		ProfileArn string `json:"profileArn"`
+		CreatedAt  int64  `json:"createdAt"`
 		// userId (account-level in Kiro Account Manager exports) embeds the Azure
 		// tenant, from which tokenEndpoint/issuerUrl/scopes are derived when missing.
 		UserID string `json:"userId"`
@@ -3037,12 +3271,66 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if config.IsAPIKeyAuthMethod(req.AuthMethod) || strings.TrimSpace(req.KiroAPIKey) != "" {
+		kiroAPIKey := strings.TrimSpace(req.KiroAPIKey)
+		if kiroAPIKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required for api_key credentials"})
+			return
+		}
+		if strings.TrimSpace(req.Region) == "" {
+			req.Region = "us-east-1"
+		}
+		provider := strings.TrimSpace(req.Provider)
+		if provider == "" {
+			provider = "APIKey"
+		}
+		email := strings.TrimSpace(req.Email)
+		if email == "" {
+			email = "Kiro API Key"
+		}
+		id := req.ID
+		if id == "" || config.AccountIDExists(id) {
+			id = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:          id,
+			Email:       email,
+			AccessToken: kiroAPIKey,
+			KiroAPIKey:  kiroAPIKey,
+			AuthMethod:  "api_key",
+			Provider:    provider,
+			Region:      req.Region,
+			Enabled:     true,
+			CreatedAt:   req.CreatedAt,
+			MachineId:   config.GenerateMachineId(),
+		}
+		if err := config.AddAccount(account); err != nil {
+			writeAddAccountError(w, err)
+			return
+		}
+
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"account": map[string]interface{}{
+				"id":    account.ID,
+				"email": account.Email,
+			},
+		})
+		return
+	}
+
 	if req.RefreshToken == "" {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
 		return
 	}
 
+	regionProvided := strings.TrimSpace(req.Region) != ""
+	if req.Region == "" {
+		req.Region = regionFromProfileArn(req.ProfileArn)
+	}
 	// 设置默认值
 	if req.Region == "" {
 		req.Region = "us-east-1"
@@ -3124,6 +3412,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			ClientSecret:  req.ClientSecret,
 			AuthMethod:    req.AuthMethod,
 			Region:        req.Region,
+			AuthRegion:    req.AuthRegion,
 			TokenEndpoint: req.TokenEndpoint,
 			Scopes:        req.Scopes,
 		}
@@ -3146,14 +3435,19 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if profileArn == "" {
 		profileArn = req.ProfileArn // external_idp refresh returns no profileArn
 	}
+	if !regionProvided {
+		if profileRegion := regionFromProfileArn(profileArn); profileRegion != "" {
+			req.Region = profileRegion
+		}
+	}
 
 	// 创建账号
 	provider := req.Provider
 	if provider == "" && req.AuthMethod == "external_idp" {
 		provider = "AzureAD"
 	}
-	// Reuse a pasted record's id when it does not collide; otherwise mint a fresh
-	// one so re-importing a backup never creates a duplicate entry.
+	// Reuse a pasted record's id when it does not collide. Semantic duplicate
+	// detection is enforced by config.AddAccount below.
 	id := req.ID
 	if id == "" || config.AccountIDExists(id) {
 		id = auth.GenerateAccountID()
@@ -3168,8 +3462,10 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		AuthMethod:    req.AuthMethod,
 		Provider:      provider,
 		Region:        req.Region,
+		AuthRegion:    req.AuthRegion,
 		ExpiresAt:     expiresAt,
 		Enabled:       true,
+		CreatedAt:     req.CreatedAt,
 		MachineId:     config.GenerateMachineId(),
 		ProfileArn:    profileArn,
 		TokenEndpoint: req.TokenEndpoint,
@@ -3178,8 +3474,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeAddAccountError(w, err)
 		return
 	}
 
@@ -3224,6 +3519,8 @@ var externalIdpAuthMethodAliases = map[string]bool{
 func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
 	am := strings.ToLower(strings.TrimSpace(authMethod))
 	switch {
+	case config.IsAPIKeyAuthMethod(am):
+		return "api_key"
 	case externalIdpAuthMethodAliases[am]:
 		return "external_idp"
 	case tokenEndpoint != "": // infer when not declared explicitly
@@ -3404,6 +3701,8 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	if err := h.ensureValidToken(account); err != nil {
+		h.handleAccountFailure(account, err)
+		h.recordFailureWithDetails("account_test", "", "token-refresh", account.ID, err)
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
 		return
@@ -3430,22 +3729,36 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
+	reqStart := time.Now()
 	var content string
+	var inputTokens, outputTokens int
+	var credits float64
+	var upstreamEndpoint string
 	callback := &KiroStreamCallback{
 		OnText:         func(text string, isThinking bool) { content += text },
 		OnToolUse:      func(tu KiroToolUse) {},
-		OnComplete:     func(inTok, outTok int) {},
+		OnComplete:     func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 		OnError:        func(err error) {},
-		OnCredits:      func(c float64) {},
+		OnCredits:      func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {},
+		OnEndpoint:     func(name string) { upstreamEndpoint = name },
 	}
 
 	err := CallKiroAPI(account, kiroPayload, callback)
 	if err != nil {
+		h.handleAccountFailure(account, err)
+		h.recordFailureWithDetails("account_test", upstreamEndpoint, req.Model, account.ID, err)
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
+	if inputTokens+outputTokens > 0 || credits > 0 {
+		h.recordSuccess(inputTokens, outputTokens, credits)
+		h.pool.RecordSuccess(account.ID)
+		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	}
+	h.recordSuccessLog("account_test", upstreamEndpoint, req.Model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -3488,8 +3801,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		config.UpdateAccountToken(id, newAccessToken, newRefreshToken, newExpiresAt)
 		h.pool.UpdateToken(id, newAccessToken, newRefreshToken, newExpiresAt)
 		if profileArn != "" {
-			account.ProfileArn = profileArn
-			config.UpdateAccountProfileArn(id, profileArn)
+			cacheResolvedProfileArn(account, profileArn)
 		}
 		return nil
 	}
@@ -3591,13 +3903,17 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"email":             account.Email,
 		"userId":            account.UserId,
 		"nickname":          account.Nickname,
+		"createdAt":         account.CreatedAt,
 		"accessToken":       account.AccessToken,
 		"refreshToken":      account.RefreshToken,
+		"kiroApiKey":        account.KiroAPIKey,
 		"clientId":          account.ClientID,
 		"clientSecret":      account.ClientSecret,
 		"authMethod":        account.AuthMethod,
 		"provider":          account.Provider,
 		"region":            account.Region,
+		"authRegion":        account.AuthRegion,
+		"effectiveRegion":   effectiveAccountRegion(account),
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
@@ -3620,6 +3936,9 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"usagePercent":      account.UsagePercent,
 		"nextResetDate":     account.NextResetDate,
 		"lastRefresh":       account.LastRefresh,
+		"usageSyncStatus":   account.UsageSyncStatus,
+		"usageSyncError":    account.UsageSyncError,
+		"usageSyncAt":       account.UsageSyncAt,
 		"trialUsageCurrent": account.TrialUsageCurrent,
 		"trialUsageLimit":   account.TrialUsageLimit,
 		"trialUsagePercent": account.TrialUsagePercent,
@@ -3871,6 +4190,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		ClientID     string `json:"clientId,omitempty"`
 		ClientSecret string `json:"clientSecret,omitempty"`
 		Region       string `json:"region,omitempty"`
+		AuthRegion   string `json:"authRegion,omitempty"`
 		ExpiresAt    int64  `json:"expiresAt"`
 		AuthMethod   string `json:"authMethod,omitempty"`
 		Provider     string `json:"provider,omitempty"`
@@ -3955,6 +4275,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				ClientID:     a.ClientID,
 				ClientSecret: a.ClientSecret,
 				Region:       a.Region,
+				AuthRegion:   a.AuthRegion,
 				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
 				AuthMethod:   authMethod,
 				Provider:     a.Provider,
@@ -3971,7 +4292,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 			},
 			Tags:       []string{},
 			Status:     "active",
-			CreatedAt:  time.Now().UnixMilli(),
+			CreatedAt:  accountCreatedAtMillis(a.CreatedAt),
 			LastUsedAt: time.Now().UnixMilli(),
 		})
 	}
@@ -3995,4 +4316,11 @@ func clampInt(v, min, max int) int {
 		return max
 	}
 	return v
+}
+
+func accountCreatedAtMillis(createdAt int64) int64 {
+	if createdAt > 0 {
+		return createdAt * 1000
+	}
+	return time.Now().UnixMilli()
 }

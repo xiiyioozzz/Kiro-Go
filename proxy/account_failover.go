@@ -112,4 +112,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	default:
 		h.pool.RecordError(account.ID, false)
 	}
+
+	if syncErr := config.UpdateAccountUsageSync(
+		account.ID,
+		usageSyncStatusFromError(err),
+		summarizeUsageSyncError(err),
+		time.Now().Unix(),
+	); syncErr != nil {
+		logger.Warnf("[AccountFailover] Failed to persist usage sync failure for %s: %v", account.Email, syncErr)
+	}
 }
