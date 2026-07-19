@@ -55,6 +55,12 @@
   --font-display: "Geist", system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, Menlo, monospace;
   --kiro-icon-filter: none;
+  --sticky-header-height: 4rem;
+  --sticky-stats-height: 7.75rem;
+  --sticky-account-header-height: 4.25rem;
+  --sticky-toolbar-height: 3.75rem;
+  --sticky-backdrop: color-mix(in oklab, var(--background) 94%, transparent);
+  --sticky-card-backdrop: color-mix(in oklab, var(--card) 96%, transparent);
   color-scheme: light;
 }
 
@@ -372,6 +378,21 @@ pre,
   gap: 0.5rem;
   align-items: center;
   flex-wrap: wrap;
+}
+.accounts-card {
+  overflow: visible;
+  padding-top: 0;
+}
+.accounts-card-header {
+  position: sticky;
+  top: calc(var(--sticky-header-height) + var(--sticky-stats-height));
+  z-index: 60;
+  margin: 0 -1.5rem;
+  padding: 1.125rem 1.5rem 1rem;
+  background: var(--sticky-card-backdrop);
+  backdrop-filter: saturate(1.2) blur(10px);
+  -webkit-backdrop-filter: saturate(1.2) blur(10px);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 
 /* Inputs */
@@ -1029,11 +1050,13 @@ label:has(> .switch) > span {
 
 /* App shell */
 .app-header {
-  position: static;
-  background: var(--background);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  border-bottom: 0;
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  background: var(--sticky-backdrop);
+  backdrop-filter: saturate(1.2) blur(10px);
+  -webkit-backdrop-filter: saturate(1.2) blur(10px);
+  border-bottom: 1px solid var(--border);
 }
 .app-header-inner {
   max-width: 1200px;
@@ -1149,9 +1172,31 @@ img.brand-icon {
   gap: 0.625rem;
   margin-bottom: 1.125rem;
 }
+.sticky-stats {
+  position: sticky;
+  top: var(--sticky-header-height);
+  z-index: 70;
+  margin-bottom: 1rem;
+  padding: 0.75rem 0 0.875rem;
+  background: var(--sticky-backdrop);
+  backdrop-filter: saturate(1.2) blur(10px);
+  -webkit-backdrop-filter: saturate(1.2) blur(10px);
+}
+.sticky-stats::before {
+  content: "";
+  position: absolute;
+  inset: 0 -1.5rem;
+  z-index: -1;
+  background: var(--sticky-backdrop);
+  border-bottom: 1px solid var(--border);
+}
 @media (max-width: 640px) {
   .stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .sticky-stats {
+    padding-top: 0.625rem;
+    padding-bottom: 0.75rem;
   }
 }
 .stat-card {
@@ -3192,6 +3237,20 @@ img.brand-icon {
   align-items: center;
   flex-wrap: wrap;
   padding-bottom: 0.75rem;
+}
+.accounts-toolbar {
+  position: sticky;
+  top: calc(var(--sticky-header-height) + var(--sticky-stats-height) + var(--sticky-account-header-height));
+  z-index: 55;
+  margin: 0 -1.5rem 1rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--sticky-card-backdrop);
+  backdrop-filter: saturate(1.2) blur(10px);
+  -webkit-backdrop-filter: saturate(1.2) blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+#accountsList {
+  padding-top: 0.25rem;
 }
 .toolbar-spacer {
   flex: 1;

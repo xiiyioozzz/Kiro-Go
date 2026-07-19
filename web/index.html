@@ -133,7 +133,7 @@
 
     <div class="container">
       <!-- Stats summary -->
-      <div class="stats-grid">
+      <div class="stats-grid sticky-stats">
         <div class="stat-card stat-card--account-summary" id="statAccountsCard" tabindex="0"
           aria-describedby="statAccountsTooltip">
           <div class="stat-card-title" data-i18n="stats.accounts"></div>
@@ -187,9 +187,9 @@
       </div>
 
       <!-- Accounts tab -->
-      <div id="tabAccounts" class="tab-content">
-        <div class="card">
-          <div class="card-header">
+      <div id="tabAccounts" class="tab-content tab-content--accounts">
+        <div class="card accounts-card">
+          <div class="card-header accounts-card-header">
             <span class="card-title" data-i18n="accounts.title"></span>
             <div class="card-actions">
               <label class="flex items-center gap-2 cursor-pointer select-none" title=""
@@ -207,7 +207,7 @@
             </div>
           </div>
 
-          <div class="toolbar">
+          <div class="toolbar accounts-toolbar">
             <label class="flex items-center gap-1.5 cursor-pointer select-none shrink-0">
               <input type="checkbox" id="selectAllCheckbox" />
               <span class="text-xs" data-i18n="batch.selectAll"></span>

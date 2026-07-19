@@ -37,6 +37,7 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let stickyOffsetRaf = 0;
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -48,6 +49,25 @@
   }
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
+  }
+  function queueStickyOffsetUpdate() {
+    if (stickyOffsetRaf) return;
+    stickyOffsetRaf = requestAnimationFrame(updateStickyOffsets);
+  }
+  function stickyHeight(selector) {
+    const el = document.querySelector(selector);
+    if (!el || el.classList.contains('hidden')) return 0;
+    return el.offsetHeight || 0;
+  }
+  function updateStickyOffsets() {
+    stickyOffsetRaf = 0;
+    const main = $('mainPage');
+    if (!main || main.classList.contains('hidden')) return;
+    const root = document.documentElement;
+    root.style.setProperty('--sticky-header-height', stickyHeight('.app-header') + 'px');
+    root.style.setProperty('--sticky-stats-height', stickyHeight('.sticky-stats') + 'px');
+    root.style.setProperty('--sticky-account-header-height', stickyHeight('#tabAccounts:not(.hidden) .accounts-card-header') + 'px');
+    root.style.setProperty('--sticky-toolbar-height', stickyHeight('#tabAccounts:not(.hidden) .accounts-toolbar') + 'px');
   }
   async function copyText(input) {
     const isPromise = input && typeof input.then === 'function';
@@ -124,6 +144,7 @@
     updateLangButtons();
     applyTheme(getThemePref());
     refreshCustomSelects();
+    queueStickyOffsetUpdate();
   }
   async function setLang(lang) {
     currentLang = lang;
@@ -134,6 +155,7 @@
     renderAccounts();
     renderPromptRules();
     renderLogs(logsCache);
+    queueStickyOffsetUpdate();
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -660,6 +682,7 @@
   function showMain() {
     $('loginPage').classList.add('hidden');
     $('mainPage').classList.remove('hidden');
+    queueStickyOffsetUpdate();
   }
 
   // Data loaders
@@ -670,6 +693,7 @@
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
+    queueStickyOffsetUpdate();
     setTimeout(checkUpdate, 2000);
   }
   async function loadStats() {
@@ -681,6 +705,7 @@
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
+    queueStickyOffsetUpdate();
   }
 
   function isAccountBanStatus(a, status) {
@@ -1063,6 +1088,7 @@
     accountsData = await res.json();
     renderAccounts();
     renderAccountSummaryStats();
+    queueStickyOffsetUpdate();
   }
 
   // Account list
@@ -1111,6 +1137,7 @@
     } else {
       bar.classList.add('hidden');
     }
+    queueStickyOffsetUpdate();
   }
 
   function formatSubscriptionLabel(type) {
@@ -3303,6 +3330,7 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    queueStickyOffsetUpdate();
   }
 
   // Event wiring
@@ -3336,8 +3364,15 @@
       const lt = e.target.closest('.lang-toggle');
       if (lt) toggleLang();
     });
-    window.addEventListener('resize', positionOpenCustomSelects);
+    window.addEventListener('resize', () => {
+      positionOpenCustomSelects();
+      queueStickyOffsetUpdate();
+    });
     window.addEventListener('scroll', positionOpenCustomSelects, true);
+    window.addEventListener('load', queueStickyOffsetUpdate);
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(queueStickyOffsetUpdate).catch(() => {});
+    }
 
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
