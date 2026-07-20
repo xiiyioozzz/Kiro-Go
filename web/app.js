@@ -2790,16 +2790,20 @@
     }
 
     const dismiss = toast(t('kiroApiKey.importing', items.length), 'primary', { duration: 0 });
-    let ok = 0, fail = 0, newIds = [];
+    let ok = 0, fail = 0, newIds = [], errorSamples = [];
     try {
       for (const payload of items) {
         try {
           const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
           const d = await res.json();
           if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
-          else fail++;
-        } catch {
+          else {
+            fail++;
+            if (d.error && errorSamples.length < 2) errorSamples.push(d.error);
+          }
+        } catch (e) {
           fail++;
+          if (errorSamples.length < 2) errorSamples.push(e?.message || t('common.failed'));
         }
       }
     } finally {
@@ -2809,6 +2813,7 @@
     closeModal(); loadAccounts(); loadStats();
     let msg = t('kiroApiKey.importResult', ok, fail);
     if (skipped > 0) msg += t('kiroApiKey.importSkipped', skipped);
+    if (errorSamples.length > 0) msg += t('kiroApiKey.importErrorExample', errorSamples.join('; '));
     if (fail > 0 || skipped > 0) toastWarning(msg, { duration: 5200 });
     else toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
@@ -2847,16 +2852,22 @@
         items = Array.isArray(json) ? json : [json];
       }
     } catch {
-      const parsed = parseLineCredentials(raw);
-      items = parsed.items;
-      skipped = parsed.skipped;
-      if (items.length === 0 && skipped === 0) {
-        toastWarning(t('credentials.jsonError'));
-        return;
-      }
-      if (items.length === 0) {
-        toastWarning(t('credentials.lineParseAllSkipped', skipped));
-        return;
+      const apiKeyParsed = parseKiroAPIKeyLines(raw, 'us-east-1');
+      if (apiKeyParsed.items.length > 0) {
+        items = apiKeyParsed.items;
+        skipped = apiKeyParsed.skipped;
+      } else {
+        const parsed = parseLineCredentials(raw);
+        items = parsed.items;
+        skipped = parsed.skipped;
+        if (items.length === 0 && skipped === 0) {
+          toastWarning(t('credentials.jsonError'));
+          return;
+        }
+        if (items.length === 0) {
+          toastWarning(t('credentials.lineParseAllSkipped', skipped));
+          return;
+        }
       }
     }
     let ok = 0, fail = 0, newIds = [];
