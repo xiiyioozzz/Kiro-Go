@@ -178,6 +178,64 @@ func TestApiImportCredentialsAcceptsKiroAPIKeyWithoutRefreshToken(t *testing.T) 
 	}
 }
 
+func TestApiImportCredentialsSplitsMultilineKiroAPIKeys(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := `{"authMethod":"api_key","provider":"APIKey","kiroApiKey":"ksk_test_batch_one\nksk_test_batch_two\nksk_test_batch_three","region":"us-east-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 importing multiline API key credentials, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Success  bool `json:"success"`
+		Added    int  `json:"added"`
+		Failed   int  `json:"failed"`
+		Accounts []struct {
+			ID    string `json:"id"`
+			Email string `json:"email"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Success || resp.Added != 3 || resp.Failed != 0 || len(resp.Accounts) != 3 {
+		t.Fatalf("expected three successful imports, got %+v body=%s", resp, rec.Body.String())
+	}
+
+	accs := config.GetAccounts()
+	if len(accs) != 3 {
+		t.Fatalf("expected three accounts, got %d", len(accs))
+	}
+	want := map[string]bool{
+		"ksk_test_batch_one":   false,
+		"ksk_test_batch_two":   false,
+		"ksk_test_batch_three": false,
+	}
+	for _, acc := range accs {
+		if acc.AuthMethod != "api_key" {
+			t.Fatalf("expected api_key auth method, got %+v", acc)
+		}
+		if _, ok := want[acc.KiroAPIKey]; !ok {
+			t.Fatalf("unexpected API key imported: %q", acc.KiroAPIKey)
+		}
+		want[acc.KiroAPIKey] = true
+	}
+	for key, seen := range want {
+		if !seen {
+			t.Fatalf("expected imported API key %q", key)
+		}
+	}
+}
+
 // TestNormalizeImportAuthMethod pins the auth-method normalization for import,
 // including the key regression: external_idp accounts carry clientId but NO
 // clientSecret, so the old default branch misclassified them as "social".

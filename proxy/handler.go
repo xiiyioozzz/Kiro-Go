@@ -9,6 +9,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,8 @@ type RequestLog struct {
 
 const requestLogsMaxSize = 500
 
+var kiroAPIKeyPattern = regexp.MustCompile(`(?i)ksk_[^\s,;'"<>]+`)
+
 func writeAddAccountError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	if config.IsDuplicateAccountError(err) {
@@ -46,6 +49,32 @@ func writeAddAccountError(w http.ResponseWriter, err error) {
 	}
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+func splitKiroAPIKeys(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	matches := kiroAPIKeyPattern.FindAllString(raw, -1)
+	if len(matches) == 0 {
+		return []string{raw}
+	}
+	keys := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		key := strings.TrimSpace(match)
+		if key == "" {
+			continue
+		}
+		fingerprint := strings.ToLower(key)
+		if _, ok := seen[fingerprint]; ok {
+			continue
+		}
+		seen[fingerprint] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // Handler HTTP 处理器
@@ -3272,8 +3301,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if config.IsAPIKeyAuthMethod(req.AuthMethod) || strings.TrimSpace(req.KiroAPIKey) != "" {
-		kiroAPIKey := strings.TrimSpace(req.KiroAPIKey)
-		if kiroAPIKey == "" {
+		kiroAPIKeys := splitKiroAPIKeys(req.KiroAPIKey)
+		if len(kiroAPIKeys) == 0 {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required for api_key credentials"})
 			return
@@ -3289,34 +3318,72 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		if email == "" {
 			email = "Kiro API Key"
 		}
-		id := req.ID
-		if id == "" || config.AccountIDExists(id) {
-			id = auth.GenerateAccountID()
+
+		created := make([]config.Account, 0, len(kiroAPIKeys))
+		failures := make([]string, 0)
+		onlyDuplicateFailures := true
+		for idx, kiroAPIKey := range kiroAPIKeys {
+			id := req.ID
+			if idx > 0 || id == "" || config.AccountIDExists(id) {
+				id = auth.GenerateAccountID()
+			}
+			accountEmail := email
+			if len(kiroAPIKeys) > 1 && strings.TrimSpace(req.Email) == "" {
+				accountEmail = fmt.Sprintf("Kiro API Key %d", idx+1)
+			}
+			account := config.Account{
+				ID:          id,
+				Email:       accountEmail,
+				AccessToken: kiroAPIKey,
+				KiroAPIKey:  kiroAPIKey,
+				AuthMethod:  "api_key",
+				Provider:    provider,
+				Region:      req.Region,
+				Enabled:     true,
+				CreatedAt:   req.CreatedAt,
+				MachineId:   config.GenerateMachineId(),
+			}
+			if err := config.AddAccount(account); err != nil {
+				if !config.IsDuplicateAccountError(err) {
+					onlyDuplicateFailures = false
+				}
+				failures = append(failures, err.Error())
+				continue
+			}
+			created = append(created, account)
 		}
-		account := config.Account{
-			ID:          id,
-			Email:       email,
-			AccessToken: kiroAPIKey,
-			KiroAPIKey:  kiroAPIKey,
-			AuthMethod:  "api_key",
-			Provider:    provider,
-			Region:      req.Region,
-			Enabled:     true,
-			CreatedAt:   req.CreatedAt,
-			MachineId:   config.GenerateMachineId(),
-		}
-		if err := config.AddAccount(account); err != nil {
-			writeAddAccountError(w, err)
+
+		if len(created) == 0 {
+			status := http.StatusInternalServerError
+			if len(failures) > 0 && onlyDuplicateFailures {
+				status = http.StatusConflict
+			}
+			w.WriteHeader(status)
+			errMsg := "failed to import kiroApiKey credentials"
+			if len(failures) > 0 {
+				errMsg = failures[0]
+			}
+			json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
 			return
 		}
 
 		h.pool.Reload()
+		accountSummaries := make([]map[string]interface{}, 0, len(created))
+		for _, account := range created {
+			accountSummaries = append(accountSummaries, map[string]interface{}{
+				"id":    account.ID,
+				"email": account.Email,
+			})
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
 			"account": map[string]interface{}{
-				"id":    account.ID,
-				"email": account.Email,
+				"id":    created[0].ID,
+				"email": created[0].Email,
 			},
+			"accounts": accountSummaries,
+			"added":    len(created),
+			"failed":   len(failures),
 		})
 		return
 	}
