@@ -214,7 +214,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			content = normalizeUserContent(content, len(images) > 0 && len(toolResults) == 0)
 
 			if isLast {
 				currentContent = content
@@ -289,6 +289,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	finalContent := ""
 	if currentContent != "" {
 		finalContent = currentContent
+	} else if len(currentToolResults) > 0 && !keepCurrentToolResults {
+		finalContent = buildToolResultsContinuation(currentToolResults)
 	} else if len(currentImages) > 0 {
 		finalContent = normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
@@ -1233,7 +1235,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := currentContent
 	if finalContent == "" {
-		if len(currentImages) > 0 {
+		if len(currentToolResults) > 0 && !keepCurrentToolResults {
+			finalContent = buildToolResultsContinuation(currentToolResults)
+		} else if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
