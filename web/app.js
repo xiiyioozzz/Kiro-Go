@@ -2607,6 +2607,7 @@
     title.textContent = t('modal.kiroApiKeyTitle');
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.kiroApiKeyDesc')) + '</p>' +
+      '<p class="help-block">' + escapeHtml(t('kiroApiKey.batchHint')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('kiroApiKey.label')) + '</label>' +
       '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('kiroApiKey.placeholder')) + '"></textarea>' +
       '<small>' + escapeHtml(t('kiroApiKey.hint')) + '</small></div>' +
@@ -2688,39 +2689,129 @@
       autoRefreshNewAccount(d.account?.id);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
+  function normalizeKiroAPIKeyItem(item, defaultRegion) {
+    let source = item;
+    if (source && typeof source === 'object' && source.credentials && typeof source.credentials === 'object') {
+      source = { ...source, ...source.credentials };
+    }
+    if (typeof source === 'string') source = { kiroApiKey: source };
+    if (!source || typeof source !== 'object') return null;
+
+    const authMethod = String(source.authMethod || source.auth_method || '').toLowerCase();
+    const key = String(
+      source.kiroApiKey ||
+      source.kiro_api_key ||
+      source.apiKey ||
+      source.api_key ||
+      source.key ||
+      (authMethod === 'api_key' || authMethod === 'apikey' ? source.accessToken || source.access_token : '') ||
+      ''
+    ).trim();
+    if (!key) return null;
+
+    return {
+      authMethod: 'api_key',
+      provider: source.provider || 'APIKey',
+      kiroApiKey: key,
+      region: source.region || source.apiRegion || source.api_region || defaultRegion || 'us-east-1',
+      ...(source.id ? { id: source.id } : {}),
+      ...(source.email ? { email: source.email } : {}),
+      ...(source.createdAt ? { createdAt: source.createdAt } : {}),
+      ...(source.created_at ? { createdAt: source.created_at } : {})
+    };
+  }
+  function parseKiroAPIKeyLines(raw, defaultRegion) {
+    const items = [];
+    let skipped = 0;
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const item = normalizeKiroAPIKeyItem(JSON.parse(trimmed), defaultRegion);
+        if (item) { items.push(item); continue; }
+      } catch {
+        // Fall through to plain text parsing.
+      }
+      const keyMatch = trimmed.match(/ksk_[^\s,;'"<>]+/i);
+      if (!keyMatch) { skipped++; continue; }
+      const emailMatch = trimmed.match(/[^\s<>"',;]+@[^\s<>"',;]+\.[^\s<>"',;]+/);
+      const item = normalizeKiroAPIKeyItem({
+        kiroApiKey: keyMatch[0],
+        email: emailMatch ? emailMatch[0] : ''
+      }, defaultRegion);
+      if (item) items.push(item);
+      else skipped++;
+    }
+    return { items, skipped };
+  }
+  function parseKiroAPIKeyInput(raw, defaultRegion) {
+    let items = [];
+    let skipped = 0;
+    try {
+      const json = JSON.parse(raw);
+      let records;
+      if (json && json.accounts && Array.isArray(json.accounts)) {
+        records = json.accounts;
+      } else {
+        records = Array.isArray(json) ? json : [json];
+      }
+      for (const record of records) {
+        const item = normalizeKiroAPIKeyItem(record, defaultRegion);
+        if (item) items.push(item);
+        else skipped++;
+      }
+    } catch {
+      const parsed = parseKiroAPIKeyLines(raw, defaultRegion);
+      items = parsed.items;
+      skipped = parsed.skipped;
+    }
+
+    const seen = new Set();
+    const unique = [];
+    for (const item of items) {
+      const fingerprint = item.kiroApiKey;
+      if (!fingerprint || seen.has(fingerprint)) { skipped++; continue; }
+      seen.add(fingerprint);
+      unique.push(item);
+    }
+    return { items: unique, skipped };
+  }
   async function importKiroAPIKey() {
     const raw = $('kiroApiKeyInput').value.trim();
     const region = $('kiroApiKeyRegion').value.trim() || 'us-east-1';
     if (!raw) return toastWarning(t('kiroApiKey.missing'));
 
-    let key = raw;
-    let email = '';
-    try {
-      const obj = JSON.parse(raw);
-      key = obj.kiroApiKey || obj.kiro_api_key || obj.apiKey || obj.key || '';
-      email = obj.email || '';
-    } catch {
-      // Raw ksk_* value is accepted.
+    const parsed = parseKiroAPIKeyInput(raw, region);
+    const items = parsed.items;
+    const skipped = parsed.skipped;
+    if (items.length === 0) {
+      if (skipped > 0) return toastWarning(t('kiroApiKey.parseAllSkipped', skipped));
+      return toastWarning(t('kiroApiKey.missing'));
     }
-    key = String(key || '').trim();
-    if (!key) return toastWarning(t('kiroApiKey.missing'));
 
-    const payload = {
-      authMethod: 'api_key',
-      provider: 'APIKey',
-      kiroApiKey: key,
-      region,
-      ...(email ? { email } : {})
-    };
-    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
-    const d = await res.json();
-    if (d.success) {
-      closeModal(); loadAccounts(); loadStats();
-      toastPrimary(t('kiroApiKey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
-      autoRefreshNewAccount(d.account?.id);
-    } else {
-      toastError(t('common.failed') + ': ' + (d.error || ''));
+    const dismiss = toast(t('kiroApiKey.importing', items.length), 'primary', { duration: 0 });
+    let ok = 0, fail = 0, newIds = [];
+    try {
+      for (const payload of items) {
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch {
+          fail++;
+        }
+      }
+    } finally {
+      if (typeof dismiss === 'function') dismiss();
     }
+
+    closeModal(); loadAccounts(); loadStats();
+    let msg = t('kiroApiKey.importResult', ok, fail);
+    if (skipped > 0) msg += t('kiroApiKey.importSkipped', skipped);
+    if (fail > 0 || skipped > 0) toastWarning(msg, { duration: 5200 });
+    else toastPrimary(msg, { duration: 5200 });
+    newIds.forEach(autoRefreshNewAccount);
   }
   async function importCredentials() {
     const raw = $('credJson').value.trim();
