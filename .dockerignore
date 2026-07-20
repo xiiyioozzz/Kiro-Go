@@ -2,6 +2,7 @@
 .github
 Kiro-Go
 data
+auth-output
 backup*
 PR-*.md
 docker-compose.yml
