@@ -4,67 +4,76 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Kiro-Go Enhanced turns your authorized Kiro accounts into a local or self-hosted OpenAI / Anthropic compatible API service, with a Web admin panel for account import, quota visibility, request logs, model discovery, and account-pool operations.
+Kiro-Go Enhanced is a local or self-hosted Kiro account gateway. It turns authorized Kiro accounts into Claude, OpenAI Chat Completions, and OpenAI Responses compatible API endpoints, and provides a Web admin panel for account import, quota visibility, model discovery, request logs, and account-pool operations.
 
 [English](README.md) | [中文](README_CN.md)
 
-This fork is based on [zsecducna/Kiro-Go](https://github.com/zsecducna/Kiro-Go) and keeps the original goal intact: provide a practical compatibility layer for Kiro-backed model access. The enhanced branch focuses on day-to-day operation with larger account pools, richer import paths, clearer account health, and a more comfortable admin workflow.
+This repository uses [Quorinex/Kiro-Go](https://github.com/Quorinex/Kiro-Go) as its upstream source. The current branch is maintained as an operations-focused edition for people who need to run, observe, and maintain a larger Kiro account pool from one dashboard.
 
 Use only accounts and credentials you own or are authorized to manage. You are responsible for complying with Kiro, AWS, Amazon, and identity-provider terms.
 
-## What This Project Does
+## Project Focus
 
-- Exposes Claude-compatible, OpenAI-compatible, and Responses-compatible API endpoints.
-- Routes requests across a Kiro account pool with refresh, failover, statistics, and per-account status.
-- Provides a Web admin panel at `/admin` for adding accounts, testing accounts, refreshing quota/model metadata, and viewing request history.
-- Supports multiple account credential sources, including Kiro OAuth flows, local cache import, credential JSON import, browser cookie import, and Kiro API key import.
-- Keeps runtime data in `data/config.json` so Docker, local source builds, and hosted deployments can all persist the same account pool.
+- **Compatible API gateway**: expose Kiro-backed model access through familiar Claude and OpenAI-style `/v1/*` endpoints.
+- **Account-pool operations**: manage many accounts from one place, with enable/disable, refresh, test, delete, weight, proxy, region, and overage controls.
+- **Credential import hub**: add accounts from hosted OAuth, SSO token, local Kiro cache, credential JSON, browser cookie refresh token, or Kiro API Key.
+- **Real operational visibility**: see callable accounts, total accounts, credits, quota state, token state, refresh failures, request success/failure counts, latency, and model metadata.
+- **Large-list admin workflow**: sticky navigation, sticky stats, sticky list controls, batch actions, search, filters, bilingual UI, and clearer account status labels.
+- **Deployment hygiene**: runtime secrets live in local `data/`, exported credentials are ignored by git/docker, and risky external IdP endpoints are validated before refresh tokens are posted.
 
-## Compared With zsecducna/Kiro-Go
+## Main Capabilities
 
-| Area | Upstream focus | Enhanced branch |
-| --- | --- | --- |
-| Account import | Core Kiro login/import flows | Adds Microsoft / Entra ID SSO, Google/GitHub hosted login, Kiro API Key import, broader credential JSON compatibility, and local-cache focused workflows |
-| Account health | Basic enabled/disabled and refresh state | Tracks callable accounts, suspended/banned/quota/auth/profile/sync states, real quota sync result, token health, and last failure reason |
-| Account operations | Single-account management plus basic bulk actions | Adds batch test, batch model refresh, better account dedupe, created time display, region edit/detect, weight, proxy, and overage controls |
-| API compatibility | Claude and OpenAI Chat Completions | Adds OpenAI Responses API support, `/v1/stats`, model aggregation, optional proxy API keys with per-key counters/limits, and thinking-mode formatting |
-| Logs | Request log view | Separates client source from Kiro upstream endpoint, records account snapshots, shows clearer failure categories, and improves table scanning |
-| Admin UI | Functional admin panel | Redesigned add-account cards, colored auth icons, sticky top navigation/stats/list controls for large account pools, polished stats popover, and bilingual copy |
-| Region/profile handling | Region-bound account refresh | Adds account-level region visibility, region detection, profile ARN preservation, and configurable profile-region probing |
-| Safety hygiene | Runtime config persistence | Ignores local `data/` and `auth-output/`, guards external IdP token endpoints, and blocks common duplicate/import mistakes |
+### API Compatibility
 
-## Key Features
+- Claude Messages: `/v1/messages`
+- Claude Count Tokens: `/v1/messages/count_tokens`
+- OpenAI Chat Completions: `/v1/chat/completions`
+- OpenAI Responses: `/v1/responses`
+- Model list: `/v1/models`
+- Runtime statistics: `/v1/stats`
 
-- API endpoints:
-  - Claude Messages: `/v1/messages`
-  - Claude Count Tokens: `/v1/messages/count_tokens`
-  - OpenAI Chat Completions: `/v1/chat/completions`
-  - OpenAI Responses: `/v1/responses`
-  - Models: `/v1/models`
-  - Runtime stats: `/v1/stats`
-- Account import methods:
-  - AWS Builder ID
-  - IAM Identity Center / Enterprise SSO
-  - Microsoft 365 / Entra ID hosted SSO
-  - Google/GitHub hosted Kiro login
-  - Kiro API Key (`ksk_...`)
-  - SSO token (`x-amz-sso_authn`)
-  - Kiro IDE local cache
-  - Kiro Account Manager / credential JSON
-  - Kiro web cookie refresh token
-- Account-pool management:
-  - Round-robin routing with failover
-  - Per-account enable/disable, delete, refresh, model refresh, and test
-  - Batch enable, disable, refresh, model refresh, test, and delete
-  - Per-account proxy URL and global outbound proxy
-  - Per-account weight for priority routing
-  - Quota/usage/credit sync, overage status, and subscription metadata
-- Admin experience:
-  - Sticky header, stats dashboard, list title, batch toolbar, search, and filter controls
-  - Callable accounts shown as `available/total` with total credits
-  - Hover summary for account availability, token state, quota state, and sync state
-  - Request logs with source endpoint, upstream endpoint, model, account, tokens, latency, credits, and categorized error detail
-  - Chinese and English UI
+### Account Import Methods
+
+- AWS Builder ID
+- IAM Identity Center / Enterprise SSO
+- Microsoft 365 / Entra ID hosted SSO
+- Google/GitHub hosted Kiro login
+- Kiro API Key (`ksk_...`)
+- Browser `x-amz-sso_authn` SSO token
+- Kiro IDE local cache
+- Kiro Account Manager / credential JSON
+- Kiro web cookie RefreshToken
+
+### Account Pool Management
+
+- Round-robin routing with request failover
+- Auto token refresh and refresh failure classification
+- Per-account enable/disable, delete, refresh, model refresh, and test
+- Batch enable, disable, refresh, model refresh, test, and delete
+- Per-account routing weight
+- Per-account proxy URL plus global outbound proxy
+- Region display, manual region edit, and region detection
+- Subscription, quota, credits, trial, overage, and model cache metadata
+- Duplicate import protection for common credential shapes
+
+### Admin Dashboard
+
+- Callable accounts displayed as `available/total`
+- Total credits shown in the account stats card
+- Hover summary for availability, disabled/banned/suspended state, token health, quota state, profile errors, and sync failures
+- Request log viewer with source endpoint, Kiro upstream endpoint, model, account, tokens, latency, credits, and categorized details
+- Add-account dialog with dedicated import cards and provider icons
+- Sticky top bar, stats dashboard, account list header, batch toolbar, search, and filter controls
+- Chinese and English interface
+
+### Security-Oriented Controls
+
+- `data/`, `auth-output/`, local logs, and exported credentials are ignored by git and docker context.
+- External IdP issuer/token endpoints must be HTTPS and match the supported allow-list before refresh tokens are sent.
+- Credential import request bodies are size-limited.
+- Hosted SSO callback listener is loopback-only by default and time-limited.
+- Proxy API keys can be required for all `/v1/*` client requests.
+- Proxy API keys support enabled state, token/credit limits, usage counters, and last-used time.
 
 ## Quick Start
 
@@ -79,7 +88,7 @@ docker compose up -d --build
 
 Open `http://127.0.0.1:8080/admin`.
 
-The Compose file publishes the Microsoft / Kiro hosted SSO callback port as `127.0.0.1:3128:3128`, so browser callback login works from the Docker host while staying off external interfaces.
+The Compose file publishes the hosted SSO callback port as `127.0.0.1:3128:3128`, so browser callback login works from the Docker host while staying off external interfaces.
 
 ### Docker Run
 
@@ -110,13 +119,15 @@ go build -o kiro-go .
 CONFIG_PATH=data/config.json ADMIN_PASSWORD=change_this_password ./kiro-go
 ```
 
-## Basic Usage
+## First Run
 
 1. Open `http://127.0.0.1:8080/admin`.
 2. Log in with the admin password. If you did not set one, the initial default is `changeme`.
-3. Add one or more Kiro accounts from the account import dialog.
-4. Refresh account usage and models.
-5. Send API requests to the compatible endpoints.
+3. Add one or more Kiro accounts from the add-account dialog.
+4. Refresh account usage and model metadata.
+5. Use the `/v1/*` endpoints from your IDE, CLI, script, or compatible client.
+
+## API Examples
 
 Claude-compatible request:
 
@@ -180,18 +191,18 @@ You can configure a global outbound proxy in Settings or set a per-account proxy
 
 - Always set a strong `ADMIN_PASSWORD` before exposing the service.
 - Enable proxy API key verification when the `/v1/*` endpoints are reachable by other machines.
-- Do not commit `data/`, `auth-output/`, exported credential JSON files, or browser cache dumps.
+- Do not commit `data/`, `auth-output/`, exported credential JSON files, browser cache dumps, or local logs.
 - Keep the SSO callback port `3128` bound to `127.0.0.1` unless you know exactly why it must be exposed.
 - Treat refresh tokens, access tokens, cookies, Kiro API keys, and exported account JSON as secrets.
 
-## Updating From Upstream
+## Upstream Reference
 
-This fork keeps `upstream` as `zsecducna/Kiro-Go`. A typical maintenance flow is:
+This repository keeps [Quorinex/Kiro-Go](https://github.com/Quorinex/Kiro-Go) as the upstream reference. A typical maintenance flow is:
 
 ```bash
 git fetch upstream
 git checkout codex-enhanced
-git merge upstream/feat/azure-tenant-sso
+git merge upstream/main
 ```
 
 Resolve conflicts carefully, then run tests and rebuild the Docker image.
