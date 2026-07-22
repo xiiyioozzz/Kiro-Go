@@ -26,8 +26,9 @@ const (
 )
 
 // KiroSocialLoginOptions starts the Kiro hosted Google/GitHub flow. Email is
-// only a local credential label/template, matching kiro.rs behavior; Kiro's
-// hosted page still decides the actual account from the browser session.
+// the expected account; Kiro's hosted page still decides the actual account
+// from the browser session, so completion verifies the returned token against it
+// when the access token exposes an email claim.
 type KiroSocialLoginOptions struct {
 	Email        string
 	ProxyURL     string
@@ -382,9 +383,9 @@ func (s *KiroSocialSession) exchange(cb kiroSocialCallback) (*KiroSocialResult, 
 	if err != nil {
 		return nil, "", fmt.Errorf("Social token exchange failed: %w", err)
 	}
-	email := strings.TrimSpace(s.Email)
-	if extracted := ExtractEmailFromJWT(token.AccessToken); extracted != "" {
-		email = extracted
+	email, err := resolveKiroSocialEmail(s.Email, ExtractEmailFromJWT(token.AccessToken))
+	if err != nil {
+		return nil, "", err
 	}
 	provider := kiroSocialProviderFromLoginOption(cb.loginOption)
 	if provider == "" {
@@ -409,6 +410,18 @@ func (s *KiroSocialSession) exchange(cb kiroSocialCallback) (*KiroSocialResult, 
 		ExpiresAt:    expiresAt,
 		Email:        email,
 	}, "completed", nil
+}
+
+func resolveKiroSocialEmail(expectedEmail, actualEmail string) (string, error) {
+	expected := strings.TrimSpace(expectedEmail)
+	actual := strings.TrimSpace(actualEmail)
+	if expected != "" && actual != "" && !strings.EqualFold(expected, actual) {
+		return "", fmt.Errorf("Kiro Social account mismatch: expected %s, but Kiro returned %s. Sign out of app.kiro.dev in the browser profile used for this login, or open the sign-in link in a fresh guest/incognito profile, then retry", expected, actual)
+	}
+	if actual != "" {
+		return actual, nil
+	}
+	return expected, nil
 }
 
 func (s *KiroSocialSession) fullRedirectURI(path, loginOption string) string {

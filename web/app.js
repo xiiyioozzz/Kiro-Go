@@ -3073,7 +3073,7 @@
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
       '<div class="form-group">' +
       '<label>' + escapeHtml(t('socialauth.emailLabel')) + ' <small>' + escapeHtml(t('socialauth.emailHint')) + '</small></label>' +
-      '<input type="email" id="kiroSocialEmail" autocomplete="email" placeholder="' + escapeAttr(t('socialauth.emailPlaceholder')) + '" />' +
+      '<input type="email" id="kiroSocialEmail" autocomplete="email" required placeholder="' + escapeAttr(t('socialauth.emailPlaceholder')) + '" />' +
       '</div>' +
       '<label class="option-box">' +
       '<input type="checkbox" id="kiroSocialIncognito" checked />' +
@@ -3106,12 +3106,13 @@
 
   async function startKiroSocialLogin() {
     const email = ($('kiroSocialEmail')?.value || '').trim();
+    if (!email) return toastError(t('socialauth.emailRequired'));
     const useIncognito = $('kiroSocialIncognito') ? $('kiroSocialIncognito').checked : true;
     let loginWindow = null;
     if (!useIncognito) loginWindow = window.open('about:blank', '_blank');
     const res = await api('/auth/social/start', {
       method: 'POST',
-      body: JSON.stringify(email ? { email } : {})
+      body: JSON.stringify({ email })
     });
     const d = await res.json();
     if (!d.sessionId || !(d.portalUrl || d.signInUrl)) {

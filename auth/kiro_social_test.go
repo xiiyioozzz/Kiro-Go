@@ -43,3 +43,20 @@ func TestKiroSocialRegionFromProfileArn(t *testing.T) {
 		t.Fatalf("region = %q, want eu-central-1", got)
 	}
 }
+
+func TestResolveKiroSocialEmailRejectsMismatchedReturnedAccount(t *testing.T) {
+	_, err := resolveKiroSocialEmail("hanlelosnsnsn928373727@gmail.com", "hoang108862.15k3@gmail.com")
+	if err == nil {
+		t.Fatalf("expected mismatched social account to be rejected")
+	}
+}
+
+func TestResolveKiroSocialEmailAcceptsCaseInsensitiveMatch(t *testing.T) {
+	got, err := resolveKiroSocialEmail("HanleLosnsnsn928373727@Gmail.com", "hanlelosnsnsn928373727@gmail.com")
+	if err != nil {
+		t.Fatalf("resolve email returned error: %v", err)
+	}
+	if got != "hanlelosnsnsn928373727@gmail.com" {
+		t.Fatalf("email = %q, want returned token email", got)
+	}
+}
