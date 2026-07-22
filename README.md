@@ -106,6 +106,8 @@ docker run -d \
   -e ADMIN_PASSWORD=change_this_password \
   -e KIRO_SSO_CALLBACK_BIND=0.0.0.0 \
   -e KIRO_SSO_CALLBACK_PORTS=3128 \
+  -e KIRO_SOCIAL_CALLBACK_BIND=0.0.0.0 \
+  -e KIRO_SOCIAL_CALLBACK_PORTS=3128 \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
   kiro-go:codex-enhanced
@@ -166,8 +168,10 @@ Runtime configuration is stored in `data/config.json` by default. Mount or back 
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password override | config file value |
 | `LOG_LEVEL` | Logger level, for example `debug`, `info`, `warn`, `error` | `info` |
-| `KIRO_SSO_CALLBACK_BIND` | Bind address for the temporary hosted-SSO callback listener | loopback only |
-| `KIRO_SSO_CALLBACK_PORTS` | Comma-separated callback ports for Google/GitHub hosted login; publish every listed host port in Docker | `3128` |
+| `KIRO_SSO_CALLBACK_BIND` | Bind address for the temporary Enterprise/Microsoft SSO callback listener | loopback only |
+| `KIRO_SSO_CALLBACK_PORTS` | Comma-separated Enterprise/Microsoft SSO callback ports; publish every listed host port in Docker | `3128` |
+| `KIRO_SOCIAL_CALLBACK_BIND` | Bind address for the temporary Google/GitHub Social callback listener | loopback only |
+| `KIRO_SOCIAL_CALLBACK_PORTS` | Comma-separated Google/GitHub Social callback ports; publish every listed host port in Docker | `3128` |
 | `KIRO_PROFILE_REGIONS` | Comma-separated profile region probe list for onboarding additional Kiro profile regions | built-in region list |
 
 ## API Authentication

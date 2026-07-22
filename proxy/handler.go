@@ -2334,6 +2334,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiCompleteKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/social/start" && r.Method == "POST":
+		h.apiStartKiroSocial(w, r)
+	case path == "/auth/social/poll" && r.Method == "POST":
+		h.apiPollKiroSocial(w, r)
+	case path == "/auth/social/complete" && r.Method == "POST":
+		h.apiCompleteKiroSocial(w, r)
+	case path == "/auth/social/cancel" && r.Method == "POST":
+		h.apiCancelKiroSocial(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -3073,11 +3081,10 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiStartKiroSso starts the Kiro hosted-portal sign-in (Enterprise SSO — Microsoft 365 /
-// Entra ID, plus Google/GitHub). It binds the loopback callback listener and returns the
-// sign-in URL the operator opens in a browser ON THE SAME HOST as the proxy (the OAuth
-// redirect targets a local loopback callback). The browser is driven through the enterprise
-// external-IdP leg automatically; the front end polls /auth/kiro-sso/poll until completion.
+// apiStartKiroSso starts the Enterprise SSO — Microsoft 365 / Entra ID flow.
+// Google/GitHub uses the separate kirors-style /auth/social/* flow below.
+// It binds the loopback callback listener and returns the sign-in URL the
+// operator opens in a browser ON THE SAME HOST as the proxy.
 func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Region    string `json:"region"`
@@ -3163,9 +3170,164 @@ func (h *Handler) writeKiroSsoAccountCreated(w http.ResponseWriter, account *con
 	})
 }
 
-// apiCompleteKiroSso finishes a Google/GitHub hosted sign-in when the operator
-// opened the sign-in URL in a separate incognito/guest browser and pasted the
-// final localhost callback URL back into the admin UI.
+func (h *Handler) apiStartKiroSocial(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		ProxyURL string `json:"proxyUrl"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	session, portalURL, err := auth.StartKiroSocialLogin(auth.KiroSocialLoginOptions{
+		Email:    req.Email,
+		ProxyURL: req.ProxyURL,
+	})
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"sessionId": session.ID,
+		"portalUrl": portalURL,
+		"signInUrl": portalURL,
+		"expiresAt": session.ExpiresAt.Format(time.RFC3339),
+		"interval":  2,
+	})
+}
+
+func (h *Handler) apiCancelKiroSocial(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.SessionID != "" {
+		auth.CancelKiroSocialLogin(req.SessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+func (h *Handler) createKiroSocialAccount(w http.ResponseWriter, result *auth.KiroSocialResult) (*config.Account, bool) {
+	expiresAt := result.ExpiresAt
+	if expiresAt == 0 && result.ExpiresIn > 0 {
+		expiresAt = time.Now().Unix() + int64(result.ExpiresIn)
+	}
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        result.Email,
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		AuthMethod:   result.AuthMethod,
+		Provider:     result.Provider,
+		Region:       result.Region,
+		ProfileArn:   result.ProfileArn,
+		ExpiresAt:    expiresAt,
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+
+	if account.Region == "" {
+		account.Region = regionFromProfileArn(account.ProfileArn)
+	}
+	if account.Region == "" {
+		account.Region = "us-east-1"
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		writeAddAccountError(w, err)
+		return nil, false
+	}
+
+	h.pool.Reload()
+	return &account, true
+}
+
+func (h *Handler) apiCompleteKiroSocial(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		Code        string `json:"code"`
+		State       string `json:"state"`
+		LoginOption string `json:"loginOption"`
+		Path        string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	result, status, err := auth.CompleteKiroSocialLogin(req.SessionID, auth.KiroSocialManualCallback{
+		Code:        req.Code,
+		State:       req.State,
+		LoginOption: req.LoginOption,
+		Path:        req.Path,
+	})
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	if status == "expired" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"completed": false,
+			"status":    "expired",
+			"error":     "login session expired",
+		})
+		return
+	}
+
+	account, ok := h.createKiroSocialAccount(w, result)
+	if !ok {
+		return
+	}
+	h.writeKiroSsoAccountCreated(w, account)
+}
+
+func (h *Handler) apiPollKiroSocial(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	result, status, err := auth.PollKiroSocialLogin(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    "pending",
+		})
+		return
+	}
+	if status == "expired" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"completed": false,
+			"status":    "expired",
+			"error":     "login session expired",
+		})
+		return
+	}
+
+	account, ok := h.createKiroSocialAccount(w, result)
+	if !ok {
+		return
+	}
+	h.writeKiroSsoAccountCreated(w, account)
+}
+
+// apiCompleteKiroSso is retained for backward compatibility with older admin
+// pages. New Google/GitHub imports use apiCompleteKiroSocial.
 func (h *Handler) apiCompleteKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID   string `json:"sessionId"`

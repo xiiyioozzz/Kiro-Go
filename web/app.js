@@ -24,6 +24,8 @@
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
+  let kiroSocialSession = '';
+  let kiroSocialPollTimer = null;
   let iamSession = '';
   let iamPollTimer = null;
   let exportSelectedIds = new Set();
@@ -2449,6 +2451,11 @@
     if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
+    if (kiroSocialPollTimer) { clearTimeout(kiroSocialPollTimer); kiroSocialPollTimer = null; }
+    if (kiroSocialSession) {
+      api('/auth/social/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSocialSession }) }).catch(() => {});
+    }
+    kiroSocialSession = '';
     if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
     // If a hosted-portal sign-in is still in flight (modal closed via X/backdrop
     // before completion), release the loopback port now. On successful completion
@@ -3056,38 +3063,148 @@
       return null;
     }
   }
-  // Google / GitHub must go through Kiro's hosted sign-in page. The page can
-  // reuse cookies from the browser that opens it, so this flow mirrors kirors:
-  // copy the login link and let the operator open it in an incognito/guest window.
+  // Google / GitHub uses a kirors-style Social OAuth session, separate from the
+  // Enterprise/Microsoft state machine.
   function modalSocialAuth(title, body) {
     title.textContent = t('modal.socialAuthTitle');
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.socialAuthDesc')) + '</p>' +
-      '<div id="kiroSsoStep1">' +
+      '<div id="kiroSocialStep1">' +
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
+      '<div class="form-group">' +
+      '<label>' + escapeHtml(t('socialauth.emailLabel')) + ' <small>' + escapeHtml(t('socialauth.emailHint')) + '</small></label>' +
+      '<input type="email" id="kiroSocialEmail" autocomplete="email" placeholder="' + escapeAttr(t('socialauth.emailPlaceholder')) + '" />' +
+      '</div>' +
+      '<label class="option-box">' +
+      '<input type="checkbox" id="kiroSocialIncognito" checked />' +
+      '<span><strong>' + escapeHtml(t('socialauth.isolatedTitle')) + '</strong><small>' + escapeHtml(t('socialauth.isolatedHint')) + '</small></span>' +
+      '</label>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSocialBtn" type="button">' + escapeHtml(t('socialauth.startLogin')) + '</button>' +
       '</div>' +
       '</div>' +
-      '<div id="kiroSsoStep2" class="hidden">' +
-      '<div class="message message-info"><p class="text-xs" id="kiroSsoModeHint">' + escapeHtml(t('socialauth.isolatedOpenInstruction')) + '</p></div>' +
+      '<div id="kiroSocialStep2" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs" id="kiroSocialModeHint">' + escapeHtml(t('socialauth.isolatedOpenInstruction')) + '</p></div>' +
       '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
-      '<div class="endpoint"><span id="kiroSsoSignInUrl" class="font-mono text-xs"></span></div>' +
+      '<textarea id="kiroSocialSignInUrl" class="font-mono text-xs login-link-box" rows="3" readonly></textarea>' +
       '<div class="flex gap-2 mt-2">' +
-      '<button class="btn btn-sm btn-primary flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('socialauth.copyLoginLink')) + '</button>' +
+      '<button class="btn btn-sm btn-primary flex-1" id="kiroSocialCopyBtn" type="button">' + escapeHtml(t('socialauth.copyLoginLink')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1 hidden" id="kiroSocialOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
       '</div>' +
       '</div>' +
       '<div class="form-group mt-3"><label>' + escapeHtml(t('socialauth.callbackUrlLabel')) + '</label>' +
-      '<textarea id="kiroSsoCallbackUrl" class="font-mono text-xs" rows="3" placeholder="' + escapeAttr(t('socialauth.callbackUrlPlaceholder')) + '"></textarea>' +
+      '<textarea id="kiroSocialCallbackUrl" class="font-mono text-xs" rows="3" placeholder="' + escapeAttr(t('socialauth.callbackUrlPlaceholder')) + '"></textarea>' +
       '<small>' + escapeHtml(t('socialauth.callbackUrlHint')) + '</small>' +
-      '<button class="btn btn-sm btn-outline w-full mt-2" id="kiroSsoCompleteBtn" type="button">' + escapeHtml(t('socialauth.completeImport')) + '</button>' +
+      '<button class="btn btn-sm btn-outline w-full mt-2" id="kiroSocialCompleteBtn" type="button">' + escapeHtml(t('socialauth.completeImport')) + '</button>' +
       '</div>' +
-      '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
-      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '<p id="kiroSocialStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSocialCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
-    $('startKiroSocialBtn').addEventListener('click', function () { startKiroSsoLogin('social'); });
+    $('startKiroSocialBtn').addEventListener('click', startKiroSocialLogin);
   }
+
+  async function startKiroSocialLogin() {
+    const email = ($('kiroSocialEmail')?.value || '').trim();
+    const useIncognito = $('kiroSocialIncognito') ? $('kiroSocialIncognito').checked : true;
+    let loginWindow = null;
+    if (!useIncognito) loginWindow = window.open('about:blank', '_blank');
+    const res = await api('/auth/social/start', {
+      method: 'POST',
+      body: JSON.stringify(email ? { email } : {})
+    });
+    const d = await res.json();
+    if (!d.sessionId || !(d.portalUrl || d.signInUrl)) {
+      if (loginWindow) loginWindow.close();
+      return toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
+    const loginUrl = d.portalUrl || d.signInUrl;
+    kiroSocialSession = d.sessionId;
+    const linkEl = $('kiroSocialSignInUrl');
+    linkEl.value = loginUrl;
+    linkEl.addEventListener('focus', () => linkEl.select());
+    $('kiroSocialStep1').classList.add('hidden');
+    $('kiroSocialStep2').classList.remove('hidden');
+    const openBtn = $('kiroSocialOpenBtn');
+    if (!useIncognito && openBtn) openBtn.classList.remove('hidden');
+    if (openBtn) openBtn.addEventListener('click', () => window.open(loginUrl, '_blank'));
+    $('kiroSocialCopyBtn').addEventListener('click', async () => {
+      await copyText(loginUrl);
+      toast(t('socialauth.linkCopied'), 'primary');
+    });
+    $('kiroSocialCancelBtn').addEventListener('click', cancelKiroSocialLogin);
+    $('kiroSocialCompleteBtn').addEventListener('click', completeKiroSocialLogin);
+    if (useIncognito) {
+      await copyText(loginUrl);
+      linkEl.focus();
+      $('kiroSocialModeHint').textContent = t('socialauth.isolatedOpenInstruction');
+      toast(t('socialauth.linkCopied'), 'primary');
+    } else if (loginWindow) {
+      loginWindow.location.href = loginUrl;
+      $('kiroSocialModeHint').textContent = t('socialauth.openInstruction');
+    }
+    pollKiroSocial(d.interval || 2);
+  }
+
+  function pollKiroSocial(interval) {
+    kiroSocialPollTimer = setTimeout(async () => {
+      const res = await api('/auth/social/poll', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: kiroSocialSession })
+      });
+      const d = await res.json();
+      if (d.completed) {
+        kiroSocialSession = '';
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else if (d.success && !d.completed) {
+        $('kiroSocialStatus').textContent = t('builderid.waiting');
+        pollKiroSocial(interval);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+        cancelKiroSocialLogin();
+      }
+    }, interval * 1000);
+  }
+
+  async function completeKiroSocialLogin() {
+    if (!kiroSocialSession) return toastError(t('socialauth.noActiveSession'));
+    const parsed = parseKiroSsoCallbackUrl($('kiroSocialCallbackUrl') && $('kiroSocialCallbackUrl').value);
+    if (!parsed) return toastError(t('socialauth.callbackUrlInvalid'));
+    const btn = $('kiroSocialCompleteBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/auth/social/complete', {
+        method: 'POST',
+        body: JSON.stringify(Object.assign({ sessionId: kiroSocialSession }, parsed))
+      });
+      const d = await res.json();
+      if (d.completed) {
+        if (kiroSocialPollTimer) { clearTimeout(kiroSocialPollTimer); kiroSocialPollTimer = null; }
+        kiroSocialSession = '';
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + ((e && e.message) || ''));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function cancelKiroSocialLogin() {
+    if (kiroSocialPollTimer) { clearTimeout(kiroSocialPollTimer); kiroSocialPollTimer = null; }
+    if (kiroSocialSession) {
+      api('/auth/social/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSocialSession }) }).catch(() => {});
+    }
+    kiroSocialSession = '';
+    showModal('add');
+  }
+
   // Enterprise SSO — Microsoft 365 / Entra ID (Azure AD), via the Kiro hosted sign-in portal.
   // The backend binds a loopback listener and returns the sign-in URL; the browser is driven
   // through the external-IdP leg automatically, and we poll until the account is created.
@@ -3118,16 +3235,14 @@
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
-    $('startKiroSsoBtn').addEventListener('click', function () { startKiroSsoLogin('enterprise'); });
+    $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
   }
-  async function startKiroSsoLogin(mode, provider) {
+  async function startKiroSsoLogin() {
     // No region prompt: the data-plane region is derived from the profile ARN
-    // returned by SSO (social) or discovered via the cross-region profile probe
-    // (external_idp / Azure), so the operator never has to know it up front.
-    const loginHint = mode === 'social' ? '' : ($('kiroSsoLoginHint')?.value || '').trim();
-    const payload = loginHint ? { loginHint, mode } : { mode };
-    if (mode === 'social' && provider) payload.provider = provider;
-    const isSocial = mode === 'social';
+    // discovered via the cross-region profile probe (external_idp / Azure), so
+    // the operator never has to know it up front.
+    const loginHint = ($('kiroSsoLoginHint')?.value || '').trim();
+    const payload = loginHint ? { loginHint, mode: 'enterprise' } : { mode: 'enterprise' };
     const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {
@@ -3135,25 +3250,15 @@
       $('kiroSsoSignInUrl').textContent = d.signInUrl;
       $('kiroSsoStep1').classList.add('hidden');
       $('kiroSsoStep2').classList.remove('hidden');
-      if (isSocial) {
-        $('kiroSsoModeHint').textContent = t('socialauth.isolatedOpenInstruction');
-      }
       const openBtn = $('kiroSsoOpenBtn');
       if (openBtn) openBtn.addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
       $('kiroSsoCopyBtn').addEventListener('click', async () => {
         await copyText($('kiroSsoSignInUrl').textContent);
-        toast(t(isSocial ? 'socialauth.linkCopied' : 'common.copied'), 'primary');
+        toast(t('common.copied'), 'primary');
       });
       $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
-      if (isSocial) {
-        const completeBtn = $('kiroSsoCompleteBtn');
-        if (completeBtn) completeBtn.addEventListener('click', completeKiroSsoLogin);
-        await copyText(d.signInUrl);
-        toast(t('socialauth.linkCopied'), 'primary');
-      } else {
-        // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
-        window.open(d.signInUrl, '_blank');
-      }
+      // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
+      window.open(d.signInUrl, '_blank');
       pollKiroSso(d.interval || 2);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
@@ -3176,34 +3281,6 @@
         cancelKiroSsoLogin();
       }
     }, interval * 1000);
-  }
-  async function completeKiroSsoLogin() {
-    if (!kiroSsoSession) return toastError(t('socialauth.noActiveSession'));
-    const input = $('kiroSsoCallbackUrl');
-    const parsed = parseKiroSsoCallbackUrl(input && input.value);
-    if (!parsed) return toastError(t('socialauth.callbackUrlInvalid'));
-    const btn = $('kiroSsoCompleteBtn');
-    if (btn) btn.disabled = true;
-    try {
-      const res = await api('/auth/kiro-sso/complete', {
-        method: 'POST',
-        body: JSON.stringify(Object.assign({ sessionId: kiroSsoSession }, parsed))
-      });
-      const d = await res.json();
-      if (d.completed) {
-        if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
-        kiroSsoSession = '';
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else {
-        toastError(t('common.failed') + ': ' + (d.error || ''));
-      }
-    } catch (e) {
-      toastError(t('common.failed') + ': ' + ((e && e.message) || ''));
-    } finally {
-      if (btn) btn.disabled = false;
-    }
   }
   function cancelKiroSsoLogin() {
     if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
