@@ -207,9 +207,9 @@ func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, strin
 	return StartKiroSsoLoginWithProvider(region, loginHint, "")
 }
 
-// StartKiroSsoLoginWithProvider starts the hosted sign-in flow and optionally
-// pins the social login provider. Kiro's current hosted page reads login_provider
-// ("Google" or "Github") and otherwise defaults to the organization lookup step.
+// StartKiroSsoLoginWithProvider starts the hosted sign-in flow. The optional
+// social provider is retained only as a fallback label; Kiro's hosted page does
+// not expose a stable query parameter for forcing Google/GitHub selection.
 func StartKiroSsoLoginWithProvider(region, loginHint, socialProvider string) (*KiroSsoSession, string, error) {
 	if region == "" {
 		region = "us-east-1"
@@ -272,9 +272,6 @@ func buildKiroHostedSignInURL(state, challenge, provider string) string {
 	params.Set("code_challenge_method", "S256")
 	params.Set("redirect_uri", kiroRedirectURI)
 	params.Set("redirect_from", kiroRedirectFrom)
-	if provider != "" {
-		params.Set("login_provider", provider)
-	}
 	return kiroSignInBaseURL + "?" + params.Encode()
 }
 

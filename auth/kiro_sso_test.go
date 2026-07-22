@@ -140,7 +140,7 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	}
 }
 
-func TestBuildKiroHostedSignInURLAddsSocialProvider(t *testing.T) {
+func TestBuildKiroHostedSignInURLOmitsUnsupportedSocialProviderHint(t *testing.T) {
 	raw := buildKiroHostedSignInURL("state-1", "challenge-1", "Github")
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -153,12 +153,14 @@ func TestBuildKiroHostedSignInURLAddsSocialProvider(t *testing.T) {
 		"code_challenge_method": "S256",
 		"redirect_uri":          "http://localhost:3128",
 		"redirect_from":         "KiroIDE",
-		"login_provider":        "Github",
 	}
 	for k, want := range checks {
 		if got := q.Get(k); got != want {
 			t.Fatalf("sign-in url param %q = %q, want %q", k, got, want)
 		}
+	}
+	if _, ok := q["login_provider"]; ok {
+		t.Fatalf("login_provider should not be emitted because the hosted page does not expose a stable provider forcing parameter")
 	}
 }
 

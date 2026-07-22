@@ -3037,10 +3037,29 @@
     builderIdSession = '';
     showModal('add');
   }
-  // Google / GitHub uses Kiro's hosted sign-in page with an explicit provider
-  // hint. Browser JavaScript cannot force an incognito window, so the default
-  // social flow copies the URL and asks the operator to open it in an isolated
-  // browser session.
+  function shellSingleQuote(value) {
+    return "'" + String(value == null ? '' : value).replace(/'/g, "'\\''") + "'";
+  }
+  function powershellSingleQuote(value) {
+    return "'" + String(value == null ? '' : value).replace(/'/g, "''") + "'";
+  }
+  function buildIsolatedBrowserCommand(signInUrl, sessionId) {
+    const rawId = String(sessionId || Date.now()).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'session';
+    const ua = (navigator.userAgent || '').toLowerCase();
+    if (ua.includes('windows')) {
+      return '$profile = Join-Path $env:TEMP ' + powershellSingleQuote('kiro-go-auth-' + rawId) + '; ' +
+        'Start-Process chrome.exe -ArgumentList @("--user-data-dir=$profile","--no-first-run","--no-default-browser-check","--new-window",' +
+        powershellSingleQuote(signInUrl) + ')';
+    }
+    if (ua.includes('mac os') || ua.includes('macintosh')) {
+      return 'open -na "Google Chrome" --args --user-data-dir=/tmp/kiro-go-auth-' + rawId +
+        ' --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
+    }
+    return 'google-chrome --user-data-dir=/tmp/kiro-go-auth-' + rawId +
+      ' --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
+  }
+  // Google / GitHub must go through Kiro's hosted sign-in page. That page can
+  // reuse browser cookies, so the reliable default is an isolated browser profile.
   function modalSocialAuth(title, body) {
     title.textContent = t('modal.socialAuthTitle');
     body.innerHTML =
@@ -3056,8 +3075,7 @@
       '</label>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-outline" id="startKiroGoogleBtn" type="button">' + escapeHtml(t('local.providerGoogle')) + '</button>' +
-      '<button class="btn btn-primary" id="startKiroGithubBtn" type="button">' + escapeHtml(t('local.providerGithub')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroSocialBtn" type="button">' + escapeHtml(t('socialauth.startLogin')) + '</button>' +
       '</div>' +
       '</div>' +
       '<div id="kiroSsoStep2" class="hidden">' +
@@ -3069,11 +3087,17 @@
       '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '</div>' +
+      '<div class="form-group mt-3 hidden" id="kiroSsoCommandGroup"><label>' + escapeHtml(t('socialauth.commandLabel')) + '</label>' +
+      '<div class="endpoint"><span id="kiroSsoIsolatedCommand" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-primary flex-1" id="kiroSsoCopyCommandBtn" type="button">' + escapeHtml(t('socialauth.copyCommand')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyLinkBtn" type="button">' + escapeHtml(t('socialauth.copyRawLink')) + '</button>' +
+      '</div>' +
+      '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
-    $('startKiroGoogleBtn').addEventListener('click', function () { startKiroSsoLogin('social', 'Google'); });
-    $('startKiroGithubBtn').addEventListener('click', function () { startKiroSsoLogin('social', 'Github'); });
+    $('startKiroSocialBtn').addEventListener('click', function () { startKiroSsoLogin('social'); });
   }
   // Enterprise SSO — Microsoft 365 / Entra ID (Azure AD), via the Kiro hosted sign-in portal.
   // The backend binds a loopback listener and returns the sign-in URL; the browser is driven
@@ -3124,7 +3148,22 @@
       $('kiroSsoStep2').classList.remove('hidden');
       if (mode === 'social') {
         $('kiroSsoModeHint').textContent = isolatedSocial ? t('socialauth.isolatedOpenInstruction') : t('socialauth.openInstruction');
-        $('kiroSsoOpenBtn').textContent = isolatedSocial ? t('socialauth.openCurrentBrowser') : t('builderid.open');
+        $('kiroSsoOpenBtn').textContent = t('builderid.open');
+        $('kiroSsoOpenBtn').classList.toggle('hidden', isolatedSocial);
+        const commandGroup = $('kiroSsoCommandGroup');
+        if (commandGroup) commandGroup.classList.toggle('hidden', !isolatedSocial);
+        if (isolatedSocial) {
+          const command = buildIsolatedBrowserCommand(d.signInUrl, d.sessionId);
+          $('kiroSsoIsolatedCommand').textContent = command;
+          $('kiroSsoCopyCommandBtn').addEventListener('click', async () => {
+            await copyText(command);
+            toast(t('socialauth.commandCopied'), 'primary');
+          });
+          $('kiroSsoCopyLinkBtn').addEventListener('click', async () => {
+            await copyText(d.signInUrl);
+            toast(t('socialauth.rawLinkCopied'), 'warning');
+          });
+        }
       }
       $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
       $('kiroSsoCopyBtn').addEventListener('click', async () => {
@@ -3133,8 +3172,8 @@
       });
       $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
       if (isolatedSocial) {
-        await copyText(d.signInUrl);
-        toast(t('socialauth.linkCopied'), 'primary');
+        await copyText($('kiroSsoIsolatedCommand').textContent);
+        toast(t('socialauth.commandCopied'), 'primary');
       } else {
         // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
         window.open(d.signInUrl, '_blank');
