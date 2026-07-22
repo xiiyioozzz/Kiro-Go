@@ -9,7 +9,7 @@ package auth
 // AWS IAM Identity Center account — can sign in to Kiro.
 //
 // The flow has two possible legs, both captured by one transient loopback
-// listener bound on the fixed redirect port:
+// listener bound on the selected redirect port:
 //
 //   - Social (Google/GitHub): the portal authenticates via its Cognito backend
 //     and redirects the authorization code straight back to the loopback
@@ -27,7 +27,7 @@ package auth
 // The login is exposed through the admin panel with the same Start/Poll session
 // pattern as Builder ID: StartKiroSsoLogin binds the listener and returns the
 // sign-in URL; the operator opens it in a browser ON THE SAME HOST (the redirect
-// targets 127.0.0.1:3128); PollKiroSsoAuth reports pending until the listener
+// targets a local loopback callback); PollKiroSsoAuth reports pending until the listener
 // captures the code, then exchanges it and returns the credential.
 
 import (
@@ -69,6 +69,10 @@ const (
 	kiroDirectCallbackBaseURL = "http://127.0.0.1:3128"
 	// kiroRedirectPort is the loopback port embedded in kiroRedirectURI.
 	kiroRedirectPort = "3128"
+	// kiroCallbackPortsEnv optionally mirrors Kiro IDE / kiro.rs style callback
+	// port selection for hosted Social login. Docker users must publish any
+	// additional host ports they put here.
+	kiroCallbackPortsEnv = "KIRO_SSO_CALLBACK_PORTS"
 	// kiroRedirectFrom mirrors the Kiro IDE client tag the portal expects.
 	kiroRedirectFrom = "KiroIDE"
 	// kiroOAuthCallbackPath is the loopback path the enterprise (external IdP)
@@ -114,13 +118,17 @@ var allowedExternalIdpIssuerSuffixes = []string{
 
 // KiroSsoSession holds the transient state for one hosted-portal sign-in attempt.
 type KiroSsoSession struct {
-	ID        string
-	Verifier  string // social-leg PKCE verifier (sent at social code exchange)
-	State     string // portal anti-CSRF state echoed on the social redirect
-	Region    string
-	Provider  string // optional social provider requested by the operator
-	ProxyURL  string
-	ExpiresAt time.Time
+	ID                    string
+	Verifier              string // social-leg PKCE verifier (sent at social code exchange)
+	State                 string // portal anti-CSRF state echoed on the social redirect
+	Region                string
+	Provider              string // optional social provider requested by the operator
+	ProxyURL              string
+	Mode                  string // "social" keeps the Google/GitHub flow off the admin browser profile
+	RedirectPort          string
+	RedirectURI           string
+	DirectCallbackBaseURL string
+	ExpiresAt             time.Time
 
 	srv       *http.Server
 	resultCh  chan kiroSsoCapture
@@ -178,6 +186,15 @@ type KiroSsoResult struct {
 	Email         string
 }
 
+// KiroSsoManualCallback is the OAuth callback data pasted back from a separate
+// browser/incognito window when the local callback cannot be captured directly.
+type KiroSsoManualCallback struct {
+	Code        string
+	State       string
+	LoginOption string
+	Path        string
+}
+
 var (
 	kiroSsoSessions   = make(map[string]*KiroSsoSession)
 	kiroSsoSessionsMu sync.RWMutex
@@ -189,6 +206,13 @@ type kiroLoginMetadata struct {
 	Found     bool     `json:"found"`
 	IssuerURL string   `json:"issuerUrl"`
 	Scopes    []string `json:"scopes"`
+}
+
+type KiroSsoLoginOptions struct {
+	Region    string
+	LoginHint string
+	Provider  string
+	Mode      string
 }
 
 // StartKiroSsoLogin generates PKCE codes, binds the loopback listener, and
@@ -211,10 +235,20 @@ func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, strin
 // social provider is retained only as a fallback label; Kiro's hosted page does
 // not expose a stable query parameter for forcing Google/GitHub selection.
 func StartKiroSsoLoginWithProvider(region, loginHint, socialProvider string) (*KiroSsoSession, string, error) {
+	return StartKiroSsoLoginWithOptions(KiroSsoLoginOptions{
+		Region:    region,
+		LoginHint: loginHint,
+		Provider:  socialProvider,
+	})
+}
+
+func StartKiroSsoLoginWithOptions(opts KiroSsoLoginOptions) (*KiroSsoSession, string, error) {
+	region := strings.TrimSpace(opts.Region)
 	if region == "" {
 		region = "us-east-1"
 	}
-	provider, err := normalizeKiroSocialProvider(socialProvider)
+	mode := normalizeKiroSsoMode(opts.Mode)
+	provider, err := normalizeKiroSocialProvider(opts.Provider)
 	if err != nil {
 		return nil, "", err
 	}
@@ -230,17 +264,20 @@ func StartKiroSsoLoginWithProvider(region, loginHint, socialProvider string) (*K
 		Region:    region,
 		Provider:  provider,
 		ProxyURL:  config.GetProxyURL(),
+		Mode:      mode,
 		ExpiresAt: time.Now().Add(kiroSsoLoginTimeout),
 		resultCh:  make(chan kiroSsoCapture, 1),
 	}
 
-	if err := session.startListener(); err != nil {
+	if err := session.startListener(kiroCallbackPortsForMode(mode)); err != nil {
 		return nil, "", err
 	}
+	session.RedirectURI = kiroRedirectURIForMode(mode, session.redirectPort())
+	session.DirectCallbackBaseURL = kiroDirectCallbackBaseURLForPort(session.redirectPort())
 
-	signInURL := buildKiroHostedSignInURL(state, challenge, provider)
-	if strings.TrimSpace(loginHint) != "" {
-		directURL, err := session.directExternalIdpDescriptorURL(loginHint)
+	signInURL := buildKiroHostedSignInURL(state, challenge, provider, session.redirectURI())
+	if strings.TrimSpace(opts.LoginHint) != "" {
+		directURL, err := session.directExternalIdpDescriptorURL(opts.LoginHint)
 		if err != nil {
 			session.close()
 			return nil, "", err
@@ -265,12 +302,19 @@ func StartKiroSsoLoginWithProvider(region, loginHint, socialProvider string) (*K
 	return session, signInURL, nil
 }
 
-func buildKiroHostedSignInURL(state, challenge, provider string) string {
+func normalizeKiroSsoMode(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), "social") {
+		return "social"
+	}
+	return "enterprise"
+}
+
+func buildKiroHostedSignInURL(state, challenge, provider, redirectURI string) string {
 	params := url.Values{}
 	params.Set("state", state)
 	params.Set("code_challenge", challenge)
 	params.Set("code_challenge_method", "S256")
-	params.Set("redirect_uri", kiroRedirectURI)
+	params.Set("redirect_uri", strings.TrimSpace(redirectURI))
 	params.Set("redirect_from", kiroRedirectFrom)
 	return kiroSignInBaseURL + "?" + params.Encode()
 }
@@ -322,7 +366,7 @@ func (s *KiroSsoSession) directExternalIdpDescriptorURL(rawHint string) (string,
 	if strings.TrimSpace(meta.ClientID) == "" || strings.TrimSpace(meta.IssuerURL) == "" || len(meta.Scopes) == 0 {
 		return "", fmt.Errorf("Kiro organization metadata for %q is incomplete", domainName)
 	}
-	return buildKiroExternalIdpDescriptorURL(s.State, loginHint, meta), nil
+	return buildKiroExternalIdpDescriptorURLWithBase(s.directCallbackBaseURL(), s.State, loginHint, meta), nil
 }
 
 func normalizeKiroLoginMetadataDomain(raw string) (domainName, loginHint string, err error) {
@@ -378,7 +422,11 @@ func fetchKiroLoginMetadata(client *http.Client, domainName string) (kiroLoginMe
 }
 
 func buildKiroExternalIdpDescriptorURL(state, loginHint string, meta kiroLoginMetadata) string {
-	u, _ := url.Parse(kiroDirectCallbackBaseURL + "/signin/callback")
+	return buildKiroExternalIdpDescriptorURLWithBase(kiroDirectCallbackBaseURL, state, loginHint, meta)
+}
+
+func buildKiroExternalIdpDescriptorURLWithBase(baseURL, state, loginHint string, meta kiroLoginMetadata) string {
+	u, _ := url.Parse(strings.TrimRight(baseURL, "/") + "/signin/callback")
 	q := u.Query()
 	q.Set("login_option", "external_idp")
 	q.Set("issuer_url", strings.TrimSpace(meta.IssuerURL))
@@ -393,6 +441,67 @@ func buildKiroExternalIdpDescriptorURL(state, loginHint string, meta kiroLoginMe
 	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func (s *KiroSsoSession) redirectPort() string {
+	if v := strings.TrimSpace(s.RedirectPort); v != "" {
+		return v
+	}
+	if strings.TrimSpace(s.RedirectURI) != "" {
+		if u, err := url.Parse(s.RedirectURI); err == nil {
+			if port := strings.TrimSpace(u.Port()); port != "" {
+				return port
+			}
+		}
+	}
+	return kiroRedirectPort
+}
+
+func (s *KiroSsoSession) redirectURI() string {
+	if v := strings.TrimSpace(s.RedirectURI); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return kiroRedirectURI
+}
+
+func (s *KiroSsoSession) directCallbackBaseURL() string {
+	if v := strings.TrimSpace(s.DirectCallbackBaseURL); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return kiroDirectCallbackBaseURL
+}
+
+func (s *KiroSsoSession) callbackRedirectURI(path, loginOption string) string {
+	base := s.redirectURI()
+	cleanPath := strings.TrimSpace(path)
+	if cleanPath == "" || cleanPath == "/" {
+		return base
+	}
+	redirectURI := strings.TrimRight(base, "/") + cleanPath
+	if option := strings.TrimSpace(loginOption); option != "" {
+		redirectURI += "?login_option=" + url.QueryEscape(option)
+	}
+	return redirectURI
+}
+
+func kiroRedirectURIForMode(mode, port string) string {
+	if strings.TrimSpace(port) == "" {
+		port = kiroRedirectPort
+	}
+	if normalizeKiroSsoMode(mode) == "social" {
+		return "http://" + net.JoinHostPort("127.0.0.1", port)
+	}
+	if port == kiroRedirectPort {
+		return kiroRedirectURI
+	}
+	return "http://" + net.JoinHostPort("localhost", port)
+}
+
+func kiroDirectCallbackBaseURLForPort(port string) string {
+	if strings.TrimSpace(port) == "" {
+		port = kiroRedirectPort
+	}
+	return "http://" + net.JoinHostPort("127.0.0.1", port)
 }
 
 // PollKiroSsoAuth reports the login status. It returns ("pending", nil) until the
@@ -427,6 +536,61 @@ func PollKiroSsoAuth(sessionID string) (*KiroSsoResult, string, error) {
 	}
 }
 
+// CompleteKiroSsoAuth completes a social Kiro hosted sign-in from callback
+// parameters pasted back by the operator. This mirrors the automatic loopback
+// callback path, but avoids depending on whichever browser profile opened the
+// admin UI.
+func CompleteKiroSsoAuth(sessionID string, cb KiroSsoManualCallback) (*KiroSsoResult, string, error) {
+	kiroSsoSessionsMu.RLock()
+	session, ok := kiroSsoSessions[sessionID]
+	kiroSsoSessionsMu.RUnlock()
+	if !ok {
+		return nil, "", fmt.Errorf("session not found or expired")
+	}
+	if time.Now().After(session.ExpiresAt) {
+		session.close()
+		removeKiroSsoSession(sessionID)
+		return nil, "", fmt.Errorf("SSO login timed out after %s", kiroSsoLoginTimeout)
+	}
+
+	code := strings.TrimSpace(cb.Code)
+	if code == "" {
+		return nil, "", fmt.Errorf("missing OAuth authorization code")
+	}
+	state := strings.TrimSpace(cb.State)
+	if session.State == "" || state != session.State {
+		return nil, "", fmt.Errorf("OAuth state mismatch, please restart login")
+	}
+
+	path := strings.TrimSpace(cb.Path)
+	if path == "" {
+		path = kiroOAuthCallbackPath
+	}
+	if path != "/" && path != kiroOAuthCallbackPath && path != "/signin/callback" {
+		return nil, "", fmt.Errorf("unsupported Kiro callback path: %s", path)
+	}
+
+	loginOption := strings.TrimSpace(cb.LoginOption)
+	provider := kiroSocialProviderFromLoginOption(loginOption)
+	redirectURI := session.callbackRedirectURI(path, "")
+	if path == kiroOAuthCallbackPath || path == "/signin/callback" {
+		if option := kiroSocialLoginOption(provider); option != "" {
+			redirectURI = session.callbackRedirectURI(path, option)
+		} else {
+			redirectURI = session.callbackRedirectURI(path, loginOption)
+		}
+	}
+
+	session.close()
+	removeKiroSsoSession(sessionID)
+	return session.exchange(kiroSsoCapture{
+		kind:        "social",
+		code:        code,
+		provider:    provider,
+		redirectURI: redirectURI,
+	})
+}
+
 // exchange swaps a captured authorization code for tokens and assembles the
 // resolved credential.
 func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, string, error) {
@@ -457,7 +621,7 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 
 	socialRedirectURI := strings.TrimSpace(capture.redirectURI)
 	if socialRedirectURI == "" {
-		socialRedirectURI = kiroRedirectURI
+		socialRedirectURI = s.redirectURI()
 	}
 	access, refresh, expiresIn, profileArn, err := exchangeSocialCode(client, capture.code, s.Verifier, socialRedirectURI)
 	if err != nil {
@@ -484,6 +648,43 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 
 // --- Loopback callback listener (state machine across the legs) -------------
 
+// kiroCallbackPorts returns the callback port list for hosted Social login. The
+// default stays at 3128 to match the Docker port mapping; set
+// KIRO_SSO_CALLBACK_PORTS=4649,6588,... only when those host ports are published.
+func kiroCallbackPorts() []string {
+	raw := strings.TrimSpace(os.Getenv(kiroCallbackPortsEnv))
+	if raw == "" {
+		return []string{kiroRedirectPort}
+	}
+	seen := map[string]bool{}
+	ports := []string{}
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		port := strings.TrimSpace(part)
+		if port == "" || seen[port] {
+			continue
+		}
+		if _, err := net.LookupPort("tcp", port); err != nil {
+			logger.Debugf("[KiroSSO] callback port %q ignored: %v", port, err)
+			continue
+		}
+		seen[port] = true
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 {
+		return []string{kiroRedirectPort}
+	}
+	return ports
+}
+
+func kiroCallbackPortsForMode(mode string) []string {
+	if normalizeKiroSsoMode(mode) == "social" {
+		return kiroCallbackPorts()
+	}
+	return []string{kiroRedirectPort}
+}
+
 // kiroCallbackBindAddrs returns the address(es) the SSO callback listener binds.
 //
 // By default it binds loopback only — IPv4 127.0.0.1 plus, best-effort, IPv6 ::1
@@ -495,46 +696,56 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 // callback is transient (closed at the deadline) and every leg is anti-CSRF
 // state-matched, but a non-loopback bind does expose it on the network for the
 // login window, so only set it in a trusted/containerized network.
-func kiroCallbackBindAddrs() []string {
-	if bind := strings.TrimSpace(os.Getenv("KIRO_SSO_CALLBACK_BIND")); bind != "" {
-		return []string{net.JoinHostPort(bind, kiroRedirectPort)}
+func kiroCallbackBindAddrs(port string) []string {
+	if strings.TrimSpace(port) == "" {
+		port = kiroRedirectPort
 	}
-	return []string{"127.0.0.1:" + kiroRedirectPort, "[::1]:" + kiroRedirectPort}
+	if bind := strings.TrimSpace(os.Getenv("KIRO_SSO_CALLBACK_BIND")); bind != "" {
+		return []string{net.JoinHostPort(bind, port)}
+	}
+	return []string{"127.0.0.1:" + port, "[::1]:" + port}
 }
 
-// startListener binds the SSO callback listener(s) on the fixed redirect port and
-// serves the redirect state machine. The first address is mandatory (its bind
-// failure aborts the login); any remaining addresses are best-effort (e.g. the IPv6
-// loopback when IPv6 is unavailable).
-func (s *KiroSsoSession) startListener() error {
-	addrs := kiroCallbackBindAddrs()
-
-	ln, err := net.Listen("tcp", addrs[0])
-	if err != nil {
-		return fmt.Errorf("cannot bind %s for the SSO callback (is the port already in use?): %w", addrs[0], err)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleCallback)
-	// ReadHeaderTimeout bounds a stalled local client (slowloris-style).
-	s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-
-	serve := func(l net.Listener) {
-		go func() {
-			if errServe := s.srv.Serve(l); errServe != nil && errServe != http.ErrServerClosed {
-				logger.Debugf("[KiroSSO] callback listener (%s) stopped: %v", l.Addr(), errServe)
-			}
-		}()
-	}
-	serve(ln)
-	for _, addr := range addrs[1:] {
-		if extra, errExtra := net.Listen("tcp", addr); errExtra == nil {
-			serve(extra)
-		} else {
-			logger.Debugf("[KiroSSO] secondary callback bind %s skipped: %v", addr, errExtra)
+// startListener binds the SSO callback listener(s) and serves the redirect state
+// machine. The first bind address for a selected port is mandatory; any remaining
+// addresses are best-effort (e.g. IPv6 loopback when IPv6 is unavailable).
+func (s *KiroSsoSession) startListener(candidatePorts []string) error {
+	var lastErr error
+	for _, port := range candidatePorts {
+		addrs := kiroCallbackBindAddrs(port)
+		ln, err := net.Listen("tcp", addrs[0])
+		if err != nil {
+			lastErr = fmt.Errorf("cannot bind %s for the SSO callback (is the port already in use?): %w", addrs[0], err)
+			continue
 		}
+		s.RedirectPort = port
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", s.handleCallback)
+		// ReadHeaderTimeout bounds a stalled local client (slowloris-style).
+		s.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+		serve := func(l net.Listener) {
+			go func() {
+				if errServe := s.srv.Serve(l); errServe != nil && errServe != http.ErrServerClosed {
+					logger.Debugf("[KiroSSO] callback listener (%s) stopped: %v", l.Addr(), errServe)
+				}
+			}()
+		}
+		serve(ln)
+		for _, addr := range addrs[1:] {
+			if extra, errExtra := net.Listen("tcp", addr); errExtra == nil {
+				serve(extra)
+			} else {
+				logger.Debugf("[KiroSSO] secondary callback bind %s skipped: %v", addr, errExtra)
+			}
+		}
+		return nil
 	}
-	return nil
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("no SSO callback ports configured")
 }
 
 // close shuts the loopback listener(s) down and stops the deadline timer. Safe to
@@ -588,7 +799,7 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 	// uses /oauth/callback.
 	if req.URL.Path == kiroOAuthCallbackPath {
 		if provider := kiroSocialProviderFromLoginOption(q.Get("login_option")); provider != "" {
-			s.handleSocialCallback(w, q, provider, kiroRedirectURI+kiroOAuthCallbackPath+"?login_option="+kiroSocialLoginOption(provider))
+			s.handleSocialCallback(w, q, provider, s.callbackRedirectURI(kiroOAuthCallbackPath, kiroSocialLoginOption(provider)))
 			return
 		}
 	}
@@ -626,7 +837,7 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 		}
 		verifier := generateCodeVerifier()
 		state2 := uuid.New().String()
-		redirectURI := kiroRedirectURI + kiroOAuthCallbackPath
+		redirectURI := s.callbackRedirectURI(kiroOAuthCallbackPath, "")
 		s.mu.Lock()
 		// Re-check under the lock to resolve a race between concurrent
 		// descriptors: only the first sets leg2 and is redirected.
@@ -689,7 +900,7 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 	}
 
 	// --- Social leg-1: Cognito authorization code ---
-	s.handleSocialCallback(w, q, "", kiroRedirectURI)
+	s.handleSocialCallback(w, q, "", s.callbackRedirectURI(req.URL.Path, q.Get("login_option")))
 }
 
 func (s *KiroSsoSession) handleSocialCallback(w http.ResponseWriter, q url.Values, provider, redirectURI string) {

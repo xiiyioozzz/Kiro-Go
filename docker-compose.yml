@@ -24,4 +24,7 @@ services:
       # network during that window; on a shared/untrusted Docker network, pin
       # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
+      # Optional comma-separated callback ports for Google/GitHub hosted login.
+      # Keep 3128 unless every listed host port is published above.
+      - KIRO_SSO_CALLBACK_PORTS=3128
     restart: unless-stopped

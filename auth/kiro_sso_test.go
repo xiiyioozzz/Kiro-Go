@@ -16,23 +16,34 @@ import (
 func TestKiroCallbackBindAddrs(t *testing.T) {
 	// Unset/blank -> loopback v4 (mandatory) + v6 (best-effort).
 	t.Setenv("KIRO_SSO_CALLBACK_BIND", "")
-	if got, want := kiroCallbackBindAddrs(), []string{"127.0.0.1:3128", "[::1]:3128"}; !reflect.DeepEqual(got, want) {
+	if got, want := kiroCallbackBindAddrs("3128"), []string{"127.0.0.1:3128", "[::1]:3128"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("default bind addrs = %v, want %v", got, want)
 	}
 	// Whitespace is treated as unset (still the secure default).
 	t.Setenv("KIRO_SSO_CALLBACK_BIND", "   ")
-	if got := kiroCallbackBindAddrs(); len(got) != 2 {
+	if got := kiroCallbackBindAddrs("3128"); len(got) != 2 {
 		t.Fatalf("whitespace should fall back to loopback default, got %v", got)
 	}
 	// IPv4 wildcard override -> single mandatory bind.
 	t.Setenv("KIRO_SSO_CALLBACK_BIND", "0.0.0.0")
-	if got, want := kiroCallbackBindAddrs(), []string{"0.0.0.0:3128"}; !reflect.DeepEqual(got, want) {
+	if got, want := kiroCallbackBindAddrs("3128"), []string{"0.0.0.0:3128"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("0.0.0.0 bind addrs = %v, want %v", got, want)
 	}
 	// IPv6 wildcard override -> bracketed host:port.
 	t.Setenv("KIRO_SSO_CALLBACK_BIND", "::")
-	if got, want := kiroCallbackBindAddrs(), []string{"[::]:3128"}; !reflect.DeepEqual(got, want) {
+	if got, want := kiroCallbackBindAddrs("3128"), []string{"[::]:3128"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf(":: bind addrs = %v, want %v", got, want)
+	}
+}
+
+func TestKiroCallbackPorts(t *testing.T) {
+	t.Setenv(kiroCallbackPortsEnv, "")
+	if got, want := kiroCallbackPorts(), []string{"3128"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("default callback ports = %v, want %v", got, want)
+	}
+	t.Setenv(kiroCallbackPortsEnv, "4649, 6588 4649;bad")
+	if got, want := kiroCallbackPorts(), []string{"4649", "6588"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("configured callback ports = %v, want %v", got, want)
 	}
 }
 
@@ -141,7 +152,7 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 }
 
 func TestBuildKiroHostedSignInURLOmitsUnsupportedSocialProviderHint(t *testing.T) {
-	raw := buildKiroHostedSignInURL("state-1", "challenge-1", "Github")
+	raw := buildKiroHostedSignInURL("state-1", "challenge-1", "Github", "http://localhost:3128")
 	u, err := url.Parse(raw)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -164,11 +175,21 @@ func TestBuildKiroHostedSignInURLOmitsUnsupportedSocialProviderHint(t *testing.T
 	}
 }
 
+func TestKiroRedirectURIForMode(t *testing.T) {
+	if got, want := kiroRedirectURIForMode("enterprise", "3128"), "http://localhost:3128"; got != want {
+		t.Fatalf("enterprise redirect uri = %q, want %q", got, want)
+	}
+	if got, want := kiroRedirectURIForMode("social", "3128"), "http://127.0.0.1:3128"; got != want {
+		t.Fatalf("social redirect uri = %q, want %q", got, want)
+	}
+}
+
 func TestHandleCallbackTreatsOAuthCallbackLoginOptionAsSocial(t *testing.T) {
 	session := &KiroSsoSession{
-		State:    "state-1",
-		Provider: "Google",
-		resultCh: make(chan kiroSsoCapture, 1),
+		State:       "state-1",
+		Provider:    "Google",
+		RedirectURI: "http://127.0.0.1:3128",
+		resultCh:    make(chan kiroSsoCapture, 1),
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:3128/oauth/callback?login_option=github&code=code-1&state=state-1", nil)
 	w := httptest.NewRecorder()
@@ -183,7 +204,7 @@ func TestHandleCallbackTreatsOAuthCallbackLoginOptionAsSocial(t *testing.T) {
 	}
 	select {
 	case got := <-session.resultCh:
-		if got.kind != "social" || got.code != "code-1" || got.provider != "Github" {
+		if got.kind != "social" || got.code != "code-1" || got.provider != "Github" || got.redirectURI != "http://127.0.0.1:3128/oauth/callback?login_option=github" {
 			t.Fatalf("capture = %+v, want social code-1 Github", got)
 		}
 	default:

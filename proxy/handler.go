@@ -2330,6 +2330,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartKiroSso(w, r)
 	case path == "/auth/kiro-sso/poll" && r.Method == "POST":
 		h.apiPollKiroSso(w, r)
+	case path == "/auth/kiro-sso/complete" && r.Method == "POST":
+		h.apiCompleteKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
@@ -3074,20 +3076,26 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 // apiStartKiroSso starts the Kiro hosted-portal sign-in (Enterprise SSO — Microsoft 365 /
 // Entra ID, plus Google/GitHub). It binds the loopback callback listener and returns the
 // sign-in URL the operator opens in a browser ON THE SAME HOST as the proxy (the OAuth
-// redirect targets 127.0.0.1:3128). The browser is driven through the enterprise external-IdP
-// leg automatically; the front end polls /auth/kiro-sso/poll until completion.
+// redirect targets a local loopback callback). The browser is driven through the enterprise
+// external-IdP leg automatically; the front end polls /auth/kiro-sso/poll until completion.
 func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Region    string `json:"region"`
 		LoginHint string `json:"loginHint"`
 		Provider  string `json:"provider"`
+		Mode      string `json:"mode"`
 	}
 	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
 	// error (including an empty body) is intentionally tolerated — mirrors
 	// apiStartBuilderIdLogin.
 	json.NewDecoder(r.Body).Decode(&req)
 
-	session, signInURL, err := auth.StartKiroSsoLoginWithProvider(req.Region, req.LoginHint, req.Provider)
+	session, signInURL, err := auth.StartKiroSsoLoginWithOptions(auth.KiroSsoLoginOptions{
+		Region:    req.Region,
+		LoginHint: req.LoginHint,
+		Provider:  req.Provider,
+		Mode:      req.Mode,
+	})
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -3113,6 +3121,85 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 		auth.CancelKiroSsoLogin(req.SessionID)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+func (h *Handler) createKiroSsoAccount(w http.ResponseWriter, result *auth.KiroSsoResult) (*config.Account, bool) {
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		writeAddAccountError(w, err)
+		return nil, false
+	}
+
+	h.pool.Reload()
+	return &account, true
+}
+
+func (h *Handler) writeKiroSsoAccountCreated(w http.ResponseWriter, account *config.Account) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
+	})
+}
+
+// apiCompleteKiroSso finishes a Google/GitHub hosted sign-in when the operator
+// opened the sign-in URL in a separate incognito/guest browser and pasted the
+// final localhost callback URL back into the admin UI.
+func (h *Handler) apiCompleteKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		Code        string `json:"code"`
+		State       string `json:"state"`
+		LoginOption string `json:"loginOption"`
+		Path        string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	result, _, err := auth.CompleteKiroSsoAuth(req.SessionID, auth.KiroSsoManualCallback{
+		Code:        req.Code,
+		State:       req.State,
+		LoginOption: req.LoginOption,
+		Path:        req.Path,
+	})
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	account, ok := h.createKiroSsoAccount(w, result)
+	if !ok {
+		return
+	}
+	h.writeKiroSsoAccountCreated(w, account)
 }
 
 // apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it
@@ -3149,40 +3236,11 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 授权完成，创建账号
-	account := config.Account{
-		ID:            auth.GenerateAccountID(),
-		Email:         result.Email,
-		AccessToken:   result.AccessToken,
-		RefreshToken:  result.RefreshToken,
-		ClientID:      result.ClientID,
-		AuthMethod:    result.AuthMethod,
-		Provider:      result.Provider,
-		Region:        result.Region,
-		ProfileArn:    result.ProfileArn,
-		TokenEndpoint: result.TokenEndpoint,
-		IssuerURL:     result.IssuerURL,
-		Scopes:        result.Scopes,
-		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
-		Enabled:       true,
-		MachineId:     config.GenerateMachineId(),
-	}
-
-	if err := config.AddAccount(account); err != nil {
-		writeAddAccountError(w, err)
+	account, ok := h.createKiroSsoAccount(w, result)
+	if !ok {
 		return
 	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"completed": true,
-		"account": map[string]interface{}{
-			"id":         account.ID,
-			"email":      account.Email,
-			"authMethod": account.AuthMethod,
-		},
-	})
+	h.writeKiroSsoAccountCreated(w, account)
 }
 
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {

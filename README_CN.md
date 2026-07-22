@@ -105,6 +105,7 @@ docker run -d \
   -e CONFIG_PATH=/app/data/config.json \
   -e ADMIN_PASSWORD=change_this_password \
   -e KIRO_SSO_CALLBACK_BIND=0.0.0.0 \
+  -e KIRO_SSO_CALLBACK_PORTS=3128 \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
   kiro-go:codex-enhanced
@@ -166,6 +167,7 @@ curl http://127.0.0.1:8080/v1/responses \
 | `ADMIN_PASSWORD` | 后台管理密码覆盖值 | 配置文件中的值 |
 | `LOG_LEVEL` | 日志等级，例如 `debug`、`info`、`warn`、`error` | `info` |
 | `KIRO_SSO_CALLBACK_BIND` | 托管 SSO 临时回调监听地址 | 仅本机回环 |
+| `KIRO_SSO_CALLBACK_PORTS` | Google/GitHub 托管登录回调端口列表，Docker 中必须发布每一个填写的宿主机端口 | `3128` |
 | `KIRO_PROFILE_REGIONS` | Profile Region 探测列表，多个 Region 用英文逗号分隔 | 内置 Region 列表 |
 
 ## API 鉴权
