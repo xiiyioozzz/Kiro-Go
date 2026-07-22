@@ -127,6 +127,76 @@ func TestAddAccountRejectsDuplicateKiroAPIKey(t *testing.T) {
 	}
 }
 
+func TestAddAccountAllowsSocialSharedProfileArnWithDifferentEmail(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	sharedProfileArn := "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+	first := Account{
+		ID:           "acct-1",
+		Email:        "first@example.com",
+		AuthMethod:   "social",
+		Provider:     "Google",
+		ProfileArn:   sharedProfileArn,
+		RefreshToken: "refresh-first",
+		Region:       "us-east-1",
+	}
+	second := Account{
+		ID:           "acct-2",
+		Email:        "second@example.com",
+		AuthMethod:   "social",
+		Provider:     "Google",
+		ProfileArn:   sharedProfileArn,
+		RefreshToken: "refresh-second",
+		Region:       "us-east-1",
+	}
+	if err := AddAccount(first); err != nil {
+		t.Fatalf("add first account: %v", err)
+	}
+	if err := AddAccount(second); err != nil {
+		t.Fatalf("expected different social accounts to allow shared profileArn, got %v", err)
+	}
+	if got := len(GetAccounts()); got != 2 {
+		t.Fatalf("expected two social accounts, got %d", got)
+	}
+}
+
+func TestAddAccountRejectsDuplicateRefreshToken(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	sharedProfileArn := "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+	first := Account{
+		ID:           "acct-1",
+		Email:        "first@example.com",
+		AuthMethod:   "social",
+		Provider:     "Google",
+		ProfileArn:   sharedProfileArn,
+		RefreshToken: "same-refresh-token",
+		Region:       "us-east-1",
+	}
+	second := Account{
+		ID:           "acct-2",
+		Email:        "second@example.com",
+		AuthMethod:   "social",
+		Provider:     "Google",
+		ProfileArn:   sharedProfileArn,
+		RefreshToken: "same-refresh-token",
+		Region:       "us-east-1",
+	}
+	if err := AddAccount(first); err != nil {
+		t.Fatalf("add first account: %v", err)
+	}
+	if err := AddAccount(second); err == nil {
+		t.Fatalf("expected duplicate refresh token to be rejected")
+	} else if !IsDuplicateAccountError(err) {
+		t.Fatalf("expected DuplicateAccountError, got %T: %v", err, err)
+	}
+	if got := len(GetAccounts()); got != 1 {
+		t.Fatalf("expected duplicate not to be appended, got %d accounts", got)
+	}
+}
+
 func TestAddAccountAllowsDifferentKiroAPIKeysWithSameLabel(t *testing.T) {
 	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("init config: %v", err)

@@ -537,7 +537,12 @@ func accountIdentityKeys(account Account) map[string]struct{} {
 		add("kiro-api-key", apiKeyHash)
 		return keys
 	}
-	add("profile", account.ProfileArn)
+	if refreshHash := secretHash(account.RefreshToken); refreshHash != "" {
+		add("refresh-token", refreshHash)
+	}
+	if !isSocialAccount(account) {
+		add("profile", account.ProfileArn)
+	}
 	add("user-region", account.UserId, region)
 	add("email-region", account.Email, authKey, region)
 	if shouldUseProviderlessEmailKey(account) {
@@ -550,6 +555,15 @@ func accountIdentityKeys(account Account) map[string]struct{} {
 		add("refresh-region", account.RefreshToken, region)
 	}
 	return keys
+}
+
+func isSocialAccount(account Account) bool {
+	authMethod := normalizeIdentityPart(account.AuthMethod)
+	if authMethod == "social" {
+		return true
+	}
+	provider := normalizeIdentityPart(account.Provider)
+	return provider == "google" || provider == "github" || provider == "google/github"
 }
 
 func normalizeIdentityPart(value string) string {
@@ -569,11 +583,15 @@ func IsAPIKeyAccount(account *Account) bool {
 }
 
 func kiroAPIKeyHash(key string) string {
-	key = strings.TrimSpace(key)
-	if key == "" {
+	return secretHash(key)
+}
+
+func secretHash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(key))
+	sum := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", sum[:])
 }
 
