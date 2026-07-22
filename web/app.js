@@ -3048,15 +3048,15 @@
     const ua = (navigator.userAgent || '').toLowerCase();
     if (ua.includes('windows')) {
       return '$profile = Join-Path $env:TEMP ' + powershellSingleQuote('kiro-go-auth-' + rawId) + '; ' +
-        'Start-Process chrome.exe -ArgumentList @("--user-data-dir=$profile","--no-first-run","--no-default-browser-check","--new-window",' +
+        'Start-Process chrome.exe -ArgumentList @("--user-data-dir=$profile","--incognito","--disable-sync","--no-first-run","--no-default-browser-check","--new-window",' +
         powershellSingleQuote(signInUrl) + ')';
     }
     if (ua.includes('mac os') || ua.includes('macintosh')) {
       return 'open -na "Google Chrome" --args --user-data-dir=/tmp/kiro-go-auth-' + rawId +
-        ' --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
+        ' --incognito --disable-sync --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
     }
     return 'google-chrome --user-data-dir=/tmp/kiro-go-auth-' + rawId +
-      ' --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
+      ' --incognito --disable-sync --no-first-run --no-default-browser-check --new-window ' + shellSingleQuote(signInUrl);
   }
   // Google / GitHub must go through Kiro's hosted sign-in page. That page can
   // reuse browser cookies, so the reliable default is an isolated browser profile.
@@ -3066,32 +3066,20 @@
       '<p class="help-block">' + escapeHtml(t('modal.socialAuthDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
-      '<label class="export-row social-isolated-row">' +
-      '<input type="checkbox" id="kiroSocialIsolated" checked />' +
-      '<span class="export-row-text">' +
-      '<span class="export-row-email">' + escapeHtml(t('socialauth.isolatedTitle')) + '</span>' +
-      '<span class="export-row-meta">' + escapeHtml(t('socialauth.isolatedHint')) + '</span>' +
-      '</span>' +
-      '</label>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSocialBtn" type="button">' + escapeHtml(t('socialauth.startLogin')) + '</button>' +
       '</div>' +
       '</div>' +
       '<div id="kiroSsoStep2" class="hidden">' +
-      '<div class="message message-info"><p class="text-xs" id="kiroSsoModeHint">' + escapeHtml(t('socialauth.openInstruction')) + '</p></div>' +
-      '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
-      '<div class="endpoint"><span id="kiroSsoSignInUrl" class="font-mono text-xs"></span></div>' +
-      '<div class="flex gap-2 mt-2">' +
-      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
-      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div class="form-group mt-3 hidden" id="kiroSsoCommandGroup"><label>' + escapeHtml(t('socialauth.commandLabel')) + '</label>' +
+      '<div class="message message-info"><p class="text-xs" id="kiroSsoModeHint">' + escapeHtml(t('socialauth.isolatedOpenInstruction')) + '</p></div>' +
+      '<span id="kiroSsoSignInUrl" class="hidden"></span>' +
+      '<button class="hidden" id="kiroSsoOpenBtn" type="button"></button>' +
+      '<button class="hidden" id="kiroSsoCopyBtn" type="button"></button>' +
+      '<div class="form-group mt-3" id="kiroSsoCommandGroup"><label>' + escapeHtml(t('socialauth.commandLabel')) + '</label>' +
       '<div class="endpoint"><span id="kiroSsoIsolatedCommand" class="font-mono text-xs"></span></div>' +
       '<div class="flex gap-2 mt-2">' +
       '<button class="btn btn-sm btn-primary flex-1" id="kiroSsoCopyCommandBtn" type="button">' + escapeHtml(t('socialauth.copyCommand')) + '</button>' +
-      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyLinkBtn" type="button">' + escapeHtml(t('socialauth.copyRawLink')) + '</button>' +
       '</div>' +
       '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
@@ -3138,7 +3126,7 @@
     const loginHint = mode === 'social' ? '' : ($('kiroSsoLoginHint')?.value || '').trim();
     const payload = loginHint ? { loginHint } : {};
     if (mode === 'social' && provider) payload.provider = provider;
-    const isolatedSocial = mode === 'social' && (($('kiroSocialIsolated')?.checked) !== false);
+    const isolatedSocial = mode === 'social';
     const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {
@@ -3158,10 +3146,6 @@
           $('kiroSsoCopyCommandBtn').addEventListener('click', async () => {
             await copyText(command);
             toast(t('socialauth.commandCopied'), 'primary');
-          });
-          $('kiroSsoCopyLinkBtn').addEventListener('click', async () => {
-            await copyText(d.signInUrl);
-            toast(t('socialauth.rawLinkCopied'), 'warning');
           });
         }
       }
