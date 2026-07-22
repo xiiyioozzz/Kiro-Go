@@ -140,6 +140,55 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	}
 }
 
+func TestBuildKiroHostedSignInURLAddsSocialProvider(t *testing.T) {
+	raw := buildKiroHostedSignInURL("state-1", "challenge-1", "Github")
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	q := u.Query()
+	checks := map[string]string{
+		"state":                 "state-1",
+		"code_challenge":        "challenge-1",
+		"code_challenge_method": "S256",
+		"redirect_uri":          "http://localhost:3128",
+		"redirect_from":         "KiroIDE",
+		"login_provider":        "Github",
+	}
+	for k, want := range checks {
+		if got := q.Get(k); got != want {
+			t.Fatalf("sign-in url param %q = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestHandleCallbackTreatsOAuthCallbackLoginOptionAsSocial(t *testing.T) {
+	session := &KiroSsoSession{
+		State:    "state-1",
+		Provider: "Google",
+		resultCh: make(chan kiroSsoCapture, 1),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:3128/oauth/callback?login_option=github&code=code-1&state=state-1", nil)
+	w := httptest.NewRecorder()
+
+	session.handleCallback(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if session.leg2 != nil {
+		t.Fatalf("social callback should not start an enterprise leg")
+	}
+	select {
+	case got := <-session.resultCh:
+		if got.kind != "social" || got.code != "code-1" || got.provider != "Github" {
+			t.Fatalf("capture = %+v, want social code-1 Github", got)
+		}
+	default:
+		t.Fatalf("expected social capture")
+	}
+}
+
 func TestNormalizeKiroLoginMetadataDomain(t *testing.T) {
 	cases := []struct {
 		in       string

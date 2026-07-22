@@ -3048,7 +3048,8 @@
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="startKiroSocialBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '<button class="btn btn-outline" id="startKiroGoogleBtn" type="button">' + escapeHtml(t('local.providerGoogle')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroGithubBtn" type="button">' + escapeHtml(t('local.providerGithub')) + '</button>' +
       '</div>' +
       '</div>' +
       '<div id="kiroSsoStep2" class="hidden">' +
@@ -3063,7 +3064,8 @@
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
-    $('startKiroSocialBtn').addEventListener('click', function () { startKiroSsoLogin('social'); });
+    $('startKiroGoogleBtn').addEventListener('click', function () { startKiroSsoLogin('social', 'Google'); });
+    $('startKiroGithubBtn').addEventListener('click', function () { startKiroSsoLogin('social', 'Github'); });
   }
   // Enterprise SSO — Microsoft 365 / Entra ID (Azure AD), via the Kiro hosted sign-in portal.
   // The backend binds a loopback listener and returns the sign-in URL; the browser is driven
@@ -3097,12 +3099,13 @@
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', function () { startKiroSsoLogin('enterprise'); });
   }
-  async function startKiroSsoLogin(mode) {
+  async function startKiroSsoLogin(mode, provider) {
     // No region prompt: the data-plane region is derived from the profile ARN
     // returned by SSO (social) or discovered via the cross-region profile probe
     // (external_idp / Azure), so the operator never has to know it up front.
     const loginHint = mode === 'social' ? '' : ($('kiroSsoLoginHint')?.value || '').trim();
     const payload = loginHint ? { loginHint } : {};
+    if (mode === 'social' && provider) payload.provider = provider;
     const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {

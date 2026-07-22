@@ -118,6 +118,7 @@ type KiroSsoSession struct {
 	Verifier  string // social-leg PKCE verifier (sent at social code exchange)
 	State     string // portal anti-CSRF state echoed on the social redirect
 	Region    string
+	Provider  string // optional social provider requested by the operator
 	ProxyURL  string
 	ExpiresAt time.Time
 
@@ -151,6 +152,7 @@ type kiroSsoCapture struct {
 	code string
 	err  error
 
+	provider      string
 	tokenEndpoint string
 	issuerURL     string
 	clientID      string
@@ -202,8 +204,19 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 // hosted sign-in page's organization lookup UI, which can get stuck in some
 // browser/proxy states.
 func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, string, error) {
+	return StartKiroSsoLoginWithProvider(region, loginHint, "")
+}
+
+// StartKiroSsoLoginWithProvider starts the hosted sign-in flow and optionally
+// pins the social login provider. Kiro's current hosted page reads login_provider
+// ("Google" or "Github") and otherwise defaults to the organization lookup step.
+func StartKiroSsoLoginWithProvider(region, loginHint, socialProvider string) (*KiroSsoSession, string, error) {
 	if region == "" {
 		region = "us-east-1"
+	}
+	provider, err := normalizeKiroSocialProvider(socialProvider)
+	if err != nil {
+		return nil, "", err
 	}
 
 	verifier := generateCodeVerifier()
@@ -215,6 +228,7 @@ func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, strin
 		Verifier:  verifier,
 		State:     state,
 		Region:    region,
+		Provider:  provider,
 		ProxyURL:  config.GetProxyURL(),
 		ExpiresAt: time.Now().Add(kiroSsoLoginTimeout),
 		resultCh:  make(chan kiroSsoCapture, 1),
@@ -224,13 +238,7 @@ func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, strin
 		return nil, "", err
 	}
 
-	params := url.Values{}
-	params.Set("state", state)
-	params.Set("code_challenge", challenge)
-	params.Set("code_challenge_method", "S256")
-	params.Set("redirect_uri", kiroRedirectURI)
-	params.Set("redirect_from", kiroRedirectFrom)
-	signInURL := kiroSignInBaseURL + "?" + params.Encode()
+	signInURL := buildKiroHostedSignInURL(state, challenge, provider)
 	if strings.TrimSpace(loginHint) != "" {
 		directURL, err := session.directExternalIdpDescriptorURL(loginHint)
 		if err != nil {
@@ -255,6 +263,51 @@ func StartKiroSsoLoginWithHint(region, loginHint string) (*KiroSsoSession, strin
 	})
 
 	return session, signInURL, nil
+}
+
+func buildKiroHostedSignInURL(state, challenge, provider string) string {
+	params := url.Values{}
+	params.Set("state", state)
+	params.Set("code_challenge", challenge)
+	params.Set("code_challenge_method", "S256")
+	params.Set("redirect_uri", kiroRedirectURI)
+	params.Set("redirect_from", kiroRedirectFrom)
+	if provider != "" {
+		params.Set("login_provider", provider)
+	}
+	return kiroSignInBaseURL + "?" + params.Encode()
+}
+
+func normalizeKiroSocialProvider(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case "google":
+		return "Google", nil
+	case "github", "git_hub", "git-hub":
+		return "Github", nil
+	default:
+		return "", fmt.Errorf("unsupported Kiro social provider: %s", raw)
+	}
+}
+
+func kiroSocialProviderFromLoginOption(raw string) string {
+	provider, err := normalizeKiroSocialProvider(raw)
+	if err != nil {
+		return ""
+	}
+	return provider
+}
+
+func kiroSocialLoginOption(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "google":
+		return "google"
+	case "github":
+		return "github"
+	default:
+		return ""
+	}
 }
 
 func (s *KiroSsoSession) directExternalIdpDescriptorURL(rawHint string) (string, error) {
@@ -405,15 +458,26 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 		}, "completed", nil
 	}
 
-	access, refresh, expiresIn, profileArn, err := exchangeSocialCode(client, capture.code, s.Verifier)
+	socialRedirectURI := strings.TrimSpace(capture.redirectURI)
+	if socialRedirectURI == "" {
+		socialRedirectURI = kiroRedirectURI
+	}
+	access, refresh, expiresIn, profileArn, err := exchangeSocialCode(client, capture.code, s.Verifier, socialRedirectURI)
 	if err != nil {
 		return nil, "", fmt.Errorf("SSO token exchange failed: %w", err)
+	}
+	provider := strings.TrimSpace(capture.provider)
+	if provider == "" {
+		provider = strings.TrimSpace(s.Provider)
+	}
+	if provider == "" {
+		provider = "Google/GitHub"
 	}
 	return &KiroSsoResult{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		AuthMethod:   "social",
-		Provider:     "Google/GitHub",
+		Provider:     provider,
 		ProfileArn:   profileArn,
 		Region:       s.Region,
 		ExpiresIn:    expiresIn,
@@ -521,6 +585,17 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 	}
 	q := req.URL.Query()
 
+	// Kiro's current hosted social CLI flow redirects to
+	// /oauth/callback?login_option=google|github. Treat that as a social callback;
+	// otherwise the enterprise leg-2 branch below would swallow it because it also
+	// uses /oauth/callback.
+	if req.URL.Path == kiroOAuthCallbackPath {
+		if provider := kiroSocialProviderFromLoginOption(q.Get("login_option")); provider != "" {
+			s.handleSocialCallback(w, q, provider, kiroRedirectURI+kiroOAuthCallbackPath+"?login_option="+kiroSocialLoginOption(provider))
+			return
+		}
+	}
+
 	// --- Enterprise leg-1: external IdP descriptor (no code) ---
 	// Gate on path != /oauth/callback so a forged /oauth/callback?issuer_url=...
 	// cannot be routed here and reset an in-flight leg-2.
@@ -617,6 +692,10 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 	}
 
 	// --- Social leg-1: Cognito authorization code ---
+	s.handleSocialCallback(w, q, "", kiroRedirectURI)
+}
+
+func (s *KiroSsoSession) handleSocialCallback(w http.ResponseWriter, q url.Values, provider, redirectURI string) {
 	code := strings.TrimSpace(q.Get("code"))
 	errParam := strings.TrimSpace(q.Get("error"))
 	state := strings.TrimSpace(q.Get("state"))
@@ -637,7 +716,10 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 		return
 	}
 	writeKiroCallbackPage(w, true)
-	s.deliver(kiroSsoCapture{kind: "social", code: code})
+	if provider == "" {
+		provider = s.Provider
+	}
+	s.deliver(kiroSsoCapture{kind: "social", code: code, provider: provider, redirectURI: redirectURI})
 }
 
 // --- OIDC discovery + token exchange (enterprise / external IdP leg) ---------
@@ -882,11 +964,14 @@ func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code,
 // verifier) for Kiro tokens at the social token endpoint. Request body matches
 // the Kiro IDE client — {code, code_verifier, redirect_uri} — and the response
 // is camelCase (accessToken/refreshToken/profileArn/expiresIn).
-func exchangeSocialCode(client *http.Client, code, codeVerifier string) (accessToken, refreshToken string, expiresIn int, profileArn string, err error) {
+func exchangeSocialCode(client *http.Client, code, codeVerifier, redirectURI string) (accessToken, refreshToken string, expiresIn int, profileArn string, err error) {
+	if strings.TrimSpace(redirectURI) == "" {
+		redirectURI = kiroRedirectURI
+	}
 	payload := map[string]string{
 		"code":          strings.TrimSpace(code),
 		"code_verifier": codeVerifier,
-		"redirect_uri":  kiroRedirectURI,
+		"redirect_uri":  redirectURI,
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, kiroSocialTokenURL, bytes.NewReader(body))

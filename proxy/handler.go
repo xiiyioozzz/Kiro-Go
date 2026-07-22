@@ -3080,13 +3080,14 @@ func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Region    string `json:"region"`
 		LoginHint string `json:"loginHint"`
+		Provider  string `json:"provider"`
 	}
 	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
 	// error (including an empty body) is intentionally tolerated — mirrors
 	// apiStartBuilderIdLogin.
 	json.NewDecoder(r.Body).Decode(&req)
 
-	session, signInURL, err := auth.StartKiroSsoLoginWithHint(req.Region, req.LoginHint)
+	session, signInURL, err := auth.StartKiroSsoLoginWithProvider(req.Region, req.LoginHint, req.Provider)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
