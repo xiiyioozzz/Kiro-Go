@@ -3037,15 +3037,23 @@
     builderIdSession = '';
     showModal('add');
   }
-  // Google / GitHub uses Kiro's hosted sign-in page without an organization hint.
-  // That keeps the browser on the normal social OAuth choice instead of forcing
-  // the enterprise organization lookup leg.
+  // Google / GitHub uses Kiro's hosted sign-in page with an explicit provider
+  // hint. Browser JavaScript cannot force an incognito window, so the default
+  // social flow copies the URL and asks the operator to open it in an isolated
+  // browser session.
   function modalSocialAuth(title, body) {
     title.textContent = t('modal.socialAuthTitle');
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.socialAuthDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
       '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.hostNote')) + '</p></div>' +
+      '<label class="export-row social-isolated-row">' +
+      '<input type="checkbox" id="kiroSocialIsolated" checked />' +
+      '<span class="export-row-text">' +
+      '<span class="export-row-email">' + escapeHtml(t('socialauth.isolatedTitle')) + '</span>' +
+      '<span class="export-row-meta">' + escapeHtml(t('socialauth.isolatedHint')) + '</span>' +
+      '</span>' +
+      '</label>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-outline" id="startKiroGoogleBtn" type="button">' + escapeHtml(t('local.providerGoogle')) + '</button>' +
@@ -3053,7 +3061,7 @@
       '</div>' +
       '</div>' +
       '<div id="kiroSsoStep2" class="hidden">' +
-      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('socialauth.openInstruction')) + '</p></div>' +
+      '<div class="message message-info"><p class="text-xs" id="kiroSsoModeHint">' + escapeHtml(t('socialauth.openInstruction')) + '</p></div>' +
       '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
       '<div class="endpoint"><span id="kiroSsoSignInUrl" class="font-mono text-xs"></span></div>' +
       '<div class="flex gap-2 mt-2">' +
@@ -3106,6 +3114,7 @@
     const loginHint = mode === 'social' ? '' : ($('kiroSsoLoginHint')?.value || '').trim();
     const payload = loginHint ? { loginHint } : {};
     if (mode === 'social' && provider) payload.provider = provider;
+    const isolatedSocial = mode === 'social' && (($('kiroSocialIsolated')?.checked) !== false);
     const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify(payload) });
     const d = await res.json();
     if (d.sessionId && d.signInUrl) {
@@ -3113,14 +3122,23 @@
       $('kiroSsoSignInUrl').textContent = d.signInUrl;
       $('kiroSsoStep1').classList.add('hidden');
       $('kiroSsoStep2').classList.remove('hidden');
+      if (mode === 'social') {
+        $('kiroSsoModeHint').textContent = isolatedSocial ? t('socialauth.isolatedOpenInstruction') : t('socialauth.openInstruction');
+        $('kiroSsoOpenBtn').textContent = isolatedSocial ? t('socialauth.openCurrentBrowser') : t('builderid.open');
+      }
       $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
       $('kiroSsoCopyBtn').addEventListener('click', async () => {
         await copyText($('kiroSsoSignInUrl').textContent);
         toast(t('common.copied'), 'primary');
       });
       $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
-      // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
-      window.open(d.signInUrl, '_blank');
+      if (isolatedSocial) {
+        await copyText(d.signInUrl);
+        toast(t('socialauth.linkCopied'), 'primary');
+      } else {
+        // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
+        window.open(d.signInUrl, '_blank');
+      }
       pollKiroSso(d.interval || 2);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }

@@ -2238,6 +2238,10 @@ img.brand-icon {
 .iam-open-row {
   margin-bottom: 0.75rem;
 }
+.social-isolated-row {
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+}
 .export-row-text {
   min-width: 0;
   display: flex;
